@@ -9,32 +9,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/dark5un/needle-writes/internal/action"
 	"github.com/dark5un/needle-writes/internal/command"
+	"github.com/dark5un/needle-writes/internal/config"
 	"github.com/dark5un/needle-writes/internal/palette"
 	"github.com/dark5un/needle-writes/internal/strata"
 	"github.com/dark5un/needle-writes/internal/waylandctl"
 )
 
+// Environment overrides (highest precedence after CLI flags); the rest
+// of the settings live in the config file (internal/config): NO
+// installation-specific paths are compiled in.
 const (
-	defaultEndpoint = "http://127.0.0.1:11434/v1"
-	// serviceEnvPath holds the local engine API key; read at runtime,
-	// never embedded, never echoed.
-	serviceEnvPath = ".config/containers/config/strata/service.env"
-	keyEnvVar      = "NEEDLE_API_KEY"
-	urlEnvVar      = "NEEDLE_STRATA_URL"
-	modelEnvVar    = "NEEDLE_MODEL"
-	// ryokuColorsPath is the live desktop palette (matugen, written by
-	// the ryoku-shell daemon). Read at runtime for the palette's
-	// selection colors; absence just means fuzzel's own defaults.
-	ryokuColorsPath = ".cache/ryoku/colors.json"
-	// palettePrompt states the operation and its target (UX review:
-	// naming the tool is not enough).
-	palettePrompt = "rewrite selection: "
+	keyEnvVar   = "NEEDLE_API_KEY"
+	urlEnvVar   = "NEEDLE_STRATA_URL"
+	modelEnvVar = "NEEDLE_MODEL"
 	// paletteWidthChars fits the longest padded item line without
 	// mid-word truncation; pinned to the registry's own budget.
 	paletteWidthChars = action.PaletteLineWidth
@@ -113,19 +105,18 @@ func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32
 	return rest, pasteCombo, copyCombo, nil
 }
 
-// themeSelection returns the live desktop palette's selection colors
-// (background, text) for the fuzzel palette, read at runtime from the
-// matugen colors file the ryoku-shell daemon writes. Any failure
-// (missing file, unknown shape) yields empty strings: fuzzel's own
-// defaults, never a crash — the picker must work on any compositor.
-func themeSelection() (bg, text string) {
-	home, err := os.UserHomeDir()
-	if err != nil {
+// themeSelection reads a matugen-style colors.json (path from the user's
+// config file; "" disables theming) and returns the palette's selection
+// colors. Any failure (missing file, unknown shape) yields empty
+// strings: fuzzel's own defaults, never a crash — the picker must work
+// on any compositor.
+func themeSelection(path string) (bg, text string) {
+	if path == "" {
 		return "", ""
 	}
-	// #nosec G304 -- ryokuColorsPath is a compile-time constant under
-	// $HOME; only the home directory itself is variable.
-	f, err := os.Open(filepath.Join(home, ryokuColorsPath))
+	// #nosec G304 -- path comes from the user's own config file, the
+	// trust boundary is the config itself.
+	f, err := os.Open(path)
 	if err != nil {
 		return "", ""
 	}
@@ -159,6 +150,31 @@ func run(args []string, hold time.Duration) int {
 		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: %v\n", cerr)
 		return command.ExitUsage
 	}
+	cfg, cfgErr := config.Load()
+	if cfgErr != nil {
+		// A malformed config (typo'd key, bad line) fails loudly and
+		// before any Wayland contact: it controls where API keys are
+		// read from.
+		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: config: %v\n", cfgErr)
+		return command.ExitUsage
+	}
+	// Config-file combos apply only where no flag overrides them.
+	if pasteCombo == nil && cfg.PasteCombo != "" {
+		codes, perr := parseCombo(cfg.PasteCombo)
+		if perr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "needle-writes: config paste_combo: %v\n", perr)
+			return command.ExitUsage
+		}
+		pasteCombo = codes
+	}
+	if copyCombo == nil && cfg.CopyCombo != "" {
+		codes, perr := parseCombo(cfg.CopyCombo)
+		if perr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "needle-writes: config copy_combo: %v\n", perr)
+			return command.ExitUsage
+		}
+		copyCombo = codes
+	}
 	wl, err := waylandctl.Connect()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: wayland: %v\n", err)
@@ -168,21 +184,19 @@ func run(args []string, hold time.Duration) int {
 
 	endpoint := os.Getenv(urlEnvVar)
 	if endpoint == "" {
-		endpoint = defaultEndpoint
+		endpoint = cfg.Endpoint
 	}
 	key := os.Getenv(keyEnvVar)
-	if key == "" {
-		if home, herr := os.UserHomeDir(); herr == nil {
-			// Missing file is fine: some Strata setups need no key; the
-			// engine call will surface any real auth problem.
-			if v, kerr := strata.ReadEnvValue(filepath.Join(home, serviceEnvPath), "API_KEY"); kerr == nil {
-				key = v
-			}
+	if key == "" && cfg.KeyFile != "" {
+		// Missing file/variable is fine: some local engines need no
+		// key; the engine call will surface any real auth problem.
+		if v, kerr := strata.ReadEnvValue(cfg.KeyFile, cfg.KeyVar); kerr == nil {
+			key = v
 		}
 	}
 	model := os.Getenv(modelEnvVar)
 	if model == "" {
-		model = "needle-writes" // Strata answers any name with the loaded model
+		model = cfg.Model // local engines answer any name with the loaded model
 	}
 	client := strata.New(endpoint, key, model)
 
@@ -200,9 +214,9 @@ func run(args []string, hold time.Duration) int {
 		Hold:        func(d time.Duration) { wl.PumpFor(d) },
 		Owns:        wl.OwnsClipboard,
 		Choose: func(items []string) (string, error) {
-			selBg, selTx := themeSelection()
+			selBg, selTx := themeSelection(cfg.ThemeFile)
 			return palette.Fuzzel(ctx, palette.Options{
-				Prompt:              palettePrompt,
+				Prompt:              cfg.PalettePrompt,
 				WidthChars:          paletteWidthChars,
 				SelectionBackground: selBg,
 				SelectionText:       selTx,

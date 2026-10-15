@@ -50,13 +50,37 @@ make build                       # -> bin/needle-writes (static)
 install -m 755 bin/needle-writes ~/.local/bin/
 ```
 
-Configuration (all optional, environment only):
+Configuration (all optional):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `NEEDLE_STRATA_URL` | `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint |
-| `NEEDLE_API_KEY` | *(local env file)* | bearer key, read at runtime |
-| `NEEDLE_MODEL` | `needle-writes` | model name sent to the endpoint |
+| `NEEDLE_STRATA_URL` | config `endpoint`, else `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint |
+| `NEEDLE_API_KEY` | config `key_file`, else none | bearer key, read at runtime, never logged |
+| `NEEDLE_MODEL` | config `model`, else `needle-writes` | model name sent to the endpoint |
+
+### Config file
+
+Persistent settings go in `$XDG_CONFIG_HOME/needle-writes/config`
+(`~/.config/needle-writes/config`): simple `KEY = VALUE` lines, `#`
+comments.
+
+```ini
+endpoint       = http://127.0.0.1:11434/v1  # OpenAI-compatible base URL
+model          = needle-writes              # name sent to the endpoint
+key_file       = ~/.config/svc/engine.env   # env-format file holding the API key
+key_var        = API_KEY                    # variable name inside key_file
+theme_file     = ~/.cache/theme/colors.json # matugen-style colors for the palette
+palette_prompt = rewrite selection:
+paste_combo    = ctrl+shift+v               # set these for terminal targets
+copy_combo     = ctrl+shift+c
+```
+
+Precedence: CLI flag > environment > config file > built-in default. An
+unknown key in the config file is a startup error — it controls where
+the API key is read from, and silent typos are worse than failing loud.
+Keys are case-insensitive; values may be quoted to keep trailing
+spaces, and ` #` (whitespace-preceded) starts a comment on a value
+line — a value that itself begins with `#` must be quoted.
 
 Hook it to a key. On Hyprland with the Lua config (e.g. `user.lua`):
 
@@ -103,10 +127,11 @@ shell), and it leans on a few Ryoku conveniences — all strictly
 best-effort, so it works on any Hyprland (≥ 0.52) that provides
 `ext-data-control` and `virtual-keyboard`:
 
-- Palette theme colors are read from the shell's live palette file when
-  present; otherwise fuzzel's own defaults apply.
-- The API key comes from `NEEDLE_API_KEY` when set; otherwise, if a
-   local service env file is configured, from there.
+- No installation-specific paths are compiled in: the engine endpoint,
+  the API-key file, the palette theme file, the prompt and the injection
+  combos all come from the config file, and every one of them has a
+  sane default or a graceful fallback (no `theme_file` means fuzzel's
+  own colors).
 - The clipboard-restore logic is content-aware: it behaves correctly
   whether or not a clipboard history watcher (the Ryoku shell,
   `wl-copy -w`, and similar managers re-own every selection) is

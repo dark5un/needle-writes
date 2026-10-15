@@ -1,37 +1,49 @@
 //go:build live
 
-// Smoke test against the real local Strata engine. Run with:
+// Smoke test against the real local engine, resolved through the same
+// config layer the binary uses (env > config file). Run with:
 //
 //	go test -tags live ./internal/strata/
 //
-// Requires the strata quadlet service up on 127.0.0.1:11434 and the key in
-// the ai-lab-quadlets service.env. Never prints the key.
+// Requires an OpenAI-compatible engine up and a key configured.
+// Never prints the key.
 package strata
 
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dark5un/needle-writes/internal/config"
 )
 
 func TestLiveStrataProofread(t *testing.T) {
-	home, err := os.UserHomeDir()
+	cfg, err := config.Load()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("config: %v", err)
 	}
-	envPath := filepath.Join(home, ".config/containers/config/strata/service.env")
-	key, err := ReadEnvValue(envPath, "API_KEY")
-	if err != nil {
-		t.Fatalf("read key: %v", err)
+	key := os.Getenv("NEEDLE_API_KEY")
+	if key == "" && cfg.KeyFile != "" {
+		key, err = ReadEnvValue(cfg.KeyFile, cfg.KeyVar)
+		if err != nil {
+			t.Fatalf("read key: %v", err)
+		}
 	}
 	if len(key) < 8 {
 		t.Fatal("suspiciously short key read")
 	}
+	endpoint := os.Getenv("NEEDLE_STRATA_URL")
+	if endpoint == "" {
+		endpoint = cfg.Endpoint
+	}
+	model := os.Getenv("NEEDLE_MODEL")
+	if model == "" {
+		model = cfg.Model
+	}
 
-	c := New("http://127.0.0.1:11434/v1", key, "qwen3.8-flash-next-iq3_s")
+	c := New(endpoint, key, model)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

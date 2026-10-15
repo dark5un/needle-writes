@@ -74,6 +74,8 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) 
 	}
 
 	url := strings.TrimRight(c.BaseURL, "/") + "/chat/completions"
+	// #nosec G704 -- the endpoint is the operator's own config/env value
+	// (a local engine URL by design); there is no untrusted input here.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("strata: request: %w", err)
@@ -81,6 +83,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
+	// #nosec G704 -- same operator-configured endpoint as above.
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("strata: %w", err)

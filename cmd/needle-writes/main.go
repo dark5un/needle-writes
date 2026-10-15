@@ -121,6 +121,8 @@ func run(args []string, hold time.Duration) int {
 		Claim:       wl.ClaimClipboard,
 		Inject:      wl.PressCombo,
 		Served:      func(d time.Duration) bool { return wl.WaitClaimServed(d) },
+		Hold:        func(d time.Duration) { wl.PumpFor(d) },
+		Owns:        wl.OwnsClipboard,
 		Choose: func(items []string) (string, error) {
 			selBg, selTx := themeSelection()
 			return palette.Fuzzel(ctx, palette.Options{

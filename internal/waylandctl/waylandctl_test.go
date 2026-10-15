@@ -87,10 +87,26 @@ func TestClaimClipboardReadableByWlPaste(t *testing.T) {
 	if err := c.ClaimClipboard(want); err != nil {
 		t.Fatal(err)
 	}
-	got := sh(t, "wl-paste", "--no-newline")
+	got := wlPasteSettled(t)
 	if got != want {
 		t.Fatalf("wl-paste after claim = %q, want %q", got, want)
 	}
+}
+
+// wlPasteSettled reads CLIPBOARD tolerating the Ryoku history watcher:
+// it re-owns every selection change and can briefly serve an EMPTY
+// copy of it while its own fetch completes (observed as wl-paste
+// exit-0 with no output ~1/3 of immediate reads under test load).
+// The watcher settles in well under a second; retry once before
+// failing the oracle.
+func wlPasteSettled(t *testing.T) string {
+	t.Helper()
+	got := sh(t, "wl-paste", "--no-newline")
+	if got == "" {
+		time.Sleep(400 * time.Millisecond)
+		got = sh(t, "wl-paste", "--no-newline")
+	}
+	return got
 }
 
 func TestUnicodeRoundTrip(t *testing.T) {
@@ -99,7 +115,7 @@ func TestUnicodeRoundTrip(t *testing.T) {
 	if err := c.ClaimClipboard(want); err != nil {
 		t.Fatal(err)
 	}
-	got := sh(t, "wl-paste", "--no-newline")
+	got := wlPasteSettled(t)
 	if got != want {
 		t.Fatalf("unicode round trip = %q, want %q", got, want)
 	}
@@ -136,6 +152,38 @@ func TestClaimThenReadOwnClaim(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("read-back of own claim = %q, want %q", got, want)
+	}
+}
+
+func TestOwnsClipboardTracksSupersede(t *testing.T) {
+	// The repeated-run guard: OwnsClipboard must be false once an
+	// external client takes CLIPBOARD (cancelled event lands on our
+	// loop). NOTE: on this machine the Ryoku history watcher re-owns
+	// every claim within microseconds, so "true right after claim"
+	// is NOT assertable — what IS assertable is the invariant the
+	// content-aware restore relies on: whenever Owns() is false
+	// right after our claim, the current content still equals OUR
+	// text (the watcher re-owns with the same text, never a
+	// different one).
+	c := requireCompositor(t)
+	want := "owns-check first"
+	if err := c.ClaimClipboard(want); err != nil {
+		t.Fatal(err)
+	}
+	if !c.OwnsClipboard() {
+		got, rerr := c.ReadClipboard()
+		if rerr != nil || got != want {
+			t.Fatalf("superseded claim must still serve our own text: %q err=%v", got, rerr)
+		}
+	}
+	sh(t, "wl-copy", "owns-check external")
+	c.PumpFor(500 * time.Millisecond) // let the cancelled event arrive
+	if c.OwnsClipboard() {
+		t.Fatal("must stop owning after an external claim supersedes us")
+	}
+	got, rerr := c.ReadClipboard()
+	if rerr != nil || got != "owns-check external" {
+		t.Fatalf("content after external supersede = %q err=%v, want the external text", got, rerr)
 	}
 }
 
@@ -225,13 +273,24 @@ func TestClaimThenImmediateWlPaste(t *testing.T) {
 	// a reader connecting immediately after ClaimClipboard must see OUR
 	// claim, not the previous (possibly dead) selection; claim()
 	// round-trips via display.sync before returning.
+	//
+	// The barrier failure mode is WRONG NON-EMPTY content (the previous
+	// selection) — that must fail on the first read. An EMPTY read is a
+	// different, external race: the Ryoku history watcher re-owns our
+	// claim microseconds after it lands and can briefly serve an empty
+	// copy mid-cycle. Tolerate only "" (one settle retry).
 	c := requireCompositor(t)
 	for i := range 20 {
 		want := fmt.Sprintf("immediate read %d", i)
 		if err := c.ClaimClipboard(want); err != nil {
 			t.Fatalf("iteration %d: %v", i, err)
 		}
-		if got := sh(t, "wl-paste", "--no-newline"); got != want {
+		got := sh(t, "wl-paste", "--no-newline")
+		if got == "" {
+			time.Sleep(400 * time.Millisecond)
+			got = sh(t, "wl-paste", "--no-newline")
+		}
+		if got != want {
 			t.Fatalf("iteration %d: wl-paste = %q, want %q", i, got, want)
 		}
 	}

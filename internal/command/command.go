@@ -41,12 +41,29 @@ type Deps struct {
 	// Served reports whether the last claim was fetched by a reader
 	// (the paste target), waiting up to timeout. nil = assume served.
 	Served func(timeout time.Duration) bool
+	// Hold keeps the claim alive and services fetches for the given
+	// duration (the paste-target grace window). nil = no hold.
+	Hold func(d time.Duration)
+	// Owns reports whether our latest clipboard claim is still the
+	// compositor's current one (not superseded by a newer run). nil =
+	// assume still owned.
+	Owns func() bool
 }
 
 // evdev keycodes for the injection combos.
 var (
 	CtrlC = []uint32{29, 46}
 	CtrlV = []uint32{29, 47}
+)
+
+// Delivery timing: how long the result claim is kept alive around the
+// paste (serve window per Ctrl+V, then a hold window that keeps serving
+// late fetches). Package vars so tests run fast; the one-shot must
+// never exit while a fetch may still be pending (dead-owner empty
+// paste = the clear-text bug).
+var (
+	pasteServeWindow = 2 * time.Second
+	pasteHoldWindow  = 2500 * time.Millisecond
 )
 
 func usage(w io.Writer) {
@@ -102,15 +119,30 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		savedClip, _ = d.ReadClip()
 	}
 
-	// restoreClip undoes the Ctrl+C fallback's clipboard clobber on any
-	// abort AFTER the capture and BEFORE delivery (delivery has its own
+	// restoreClip undoes the run's clipboard clobber on any abort
+	// AFTER the capture and BEFORE delivery (delivery has its own
 	// restore). Reviewer finding (round 3): a palette cancel after a
 	// clobbering capture must leave the user's clipboard as it was.
-	restoreClip := func() {
-		if clobbered && savedClip != "" {
-			if rerr := d.Claim(savedClip); rerr != nil {
-				_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard restore failed: %v\n", rerr)
+	//
+	// expected is the text this run last put on CLIPBOARD (the Ctrl+C
+	// copy on abort paths, the result on the delivery path). The
+	// Ryoku history watcher re-owns every selection change with the
+	// SAME text, so a superseded source is normal; only a DIFFERENT
+	// text means a newer needle-writes run took over, and restoring
+	// over its result would clobber it and re-open the dead-owner
+	// empty-paste race for its paste target.
+	restoreClip := func(expected string) {
+		if !clobbered || savedClip == "" {
+			return
+		}
+		if d.Owns != nil && !d.Owns() {
+			cur, rerr := d.ReadClip()
+			if rerr != nil || cur != expected {
+				return
 			}
+		}
+		if rerr := d.Claim(savedClip); rerr != nil {
+			_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard restore failed: %v\n", rerr)
 		}
 	}
 
@@ -132,13 +164,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		sel, capErr = d.ReadClip()
 		if capErr != nil {
 			_, _ = fmt.Fprintf(stderr, "read clipboard: %v\n", capErr)
-			restoreClip() // round-4 finding 1: post-Ctrl+C abort
+			restoreClip(sel) // round-4 finding 1: post-Ctrl+C abort
 			return ExitWayland
 		}
 	}
 	if sel == "" {
 		_, _ = fmt.Fprintln(stderr, "needle-writes: no text selected — select text (or copy it) and try again")
-		restoreClip()
+		restoreClip(sel)
 		return ExitNoSelection
 	}
 
@@ -148,17 +180,17 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		line, cerr := d.Choose(action.PaletteItems())
 		if cerr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: palette: %v\n", cerr)
-			restoreClip()
+			restoreClip(sel)
 			return ExitWayland
 		}
 		if line == "" {
-			restoreClip()
+			restoreClip(sel)
 			return ExitCancelled
 		}
 		picked, perr := action.ParsePaletteItem(line)
 		if perr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", perr)
-			restoreClip()
+			restoreClip(sel)
 			return ExitUsage
 		}
 		act = picked
@@ -167,31 +199,31 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	msgs, err := action.BuildMessages(act.Name, sel)
 	if errors.Is(err, action.ErrTooLarge) {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
-		restoreClip()
+		restoreClip(sel)
 		return ExitTooLarge
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
-		restoreClip()
+		restoreClip(sel)
 		return ExitUsage
 	}
 
 	res, err := d.Chat(ctx, msgs, act.Temperature)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: engine call failed: %v\n", err)
-		restoreClip()
+		restoreClip(sel)
 		return ExitEngine
 	}
 	res = action.Clean(res)
 	if res == "" {
 		// Never paste nothing: an empty model result aborts the action.
 		_, _ = fmt.Fprintln(stderr, "needle-writes: engine returned an empty result, aborting")
-		restoreClip()
+		restoreClip(sel)
 		return ExitEngine
 	}
 	if clErr := d.Claim(res); clErr != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard claim failed: %v\n", clErr)
-		restoreClip()
+		restoreClip(sel)
 		return ExitWayland
 	}
 	// The result claim itself clobbers CLIPBOARD: from here the same
@@ -201,13 +233,29 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if ierr := d.Inject(CtrlV...); ierr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: Ctrl+V injection failed: %v (result stays on the clipboard for manual paste)\n", ierr)
 		} else {
-			if d.Served != nil && !d.Served(2*time.Second) {
-				_, _ = fmt.Fprintln(stderr, "needle-writes: paste target did not fetch the result within 2s")
+			// The clear-text bug: the served signal cannot prove the
+			// PASTE TARGET fetched — a clipboard-history watcher (the
+			// Ryoku shell fetches every claim) satisfies it instantly.
+			// Restoring and exiting right then leaves a DEAD clipboard
+			// owner; the app's late fetch pastes an EMPTY string over
+			// the selection. So: retry the keystroke only when NOBODY
+			// fetched at all, and always hold the claim (keep serving)
+			// for a grace window before restoring.
+			served := d.Served == nil || d.Served(pasteServeWindow)
+			if !served {
+				// Silent: the keystroke most likely landed during a
+				// focus transition (palette close). One retry.
+				if rerr := d.Inject(CtrlV...); rerr == nil {
+					served = d.Served == nil || d.Served(pasteServeWindow)
+				}
 			}
-			// The paste has been served (or the target declined it): put
-			// the user's original clipboard back (round-4 nit: reuse the
-			// restore rule — Claim(res) above set clobbered).
-			restoreClip()
+			if d.Hold != nil {
+				d.Hold(pasteHoldWindow)
+			}
+			if !served {
+				_, _ = fmt.Fprintln(stderr, "needle-writes: paste target never fetched the result; nothing was pasted, restoring your clipboard")
+			}
+			restoreClip(res)
 		}
 	}
 	_, _ = fmt.Fprint(stdout, res)

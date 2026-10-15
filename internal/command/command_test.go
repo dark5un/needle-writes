@@ -13,24 +13,28 @@ import (
 
 // fake deps: capture seams instead of a live compositor/engine.
 type deps struct {
-	primaryErr   error
-	claimErr     error
-	chatErr      error
-	injectErr    error
-	chooseErr    error
-	primary      string
-	clipboard    string
-	chatOut      string
-	afterCtrlC   string
-	chooseLine   string
-	claims       []string
-	chatMsgs     []action.Message
-	combos       [][]uint32
-	chooseItems  []string
-	chatCalled   bool
-	chooseCalled bool
-	servedYes    bool
-	servedCall   bool
+	primaryErr     error
+	claimErr       error
+	chatErr        error
+	injectErr      error
+	chooseErr      error
+	primary        string
+	clipboard      string
+	chatOut        string
+	afterCtrlC     string
+	afterClaimClip string // if set: next Claim makes the clipboard hold this (newer-run sim)
+	chooseLine     string
+	claims         []string
+	chatMsgs       []action.Message
+	combos         [][]uint32
+	chooseItems    []string
+	holds          []time.Duration
+	chatCalled     bool
+	chooseCalled   bool
+	servedYes      bool
+	servedCall     bool
+	notOwns        bool // true: our claim was superseded by a newer run
+	servedCalls    int
 }
 
 func (d *deps) lastClaim() string {
@@ -46,6 +50,15 @@ func (d *deps) testDeps() Deps {
 		ReadClip:    func() (string, error) { return d.clipboard, nil },
 		Claim: func(s string) error {
 			d.claims = append(d.claims, s)
+			// Realistic: after a claim the clipboard (and the
+			// watcher's re-owned copy) holds the claimed text,
+			// unless the test simulates a newer run replacing it.
+			if d.afterClaimClip != "" {
+				d.clipboard = d.afterClaimClip
+				d.afterClaimClip = ""
+			} else {
+				d.clipboard = s
+			}
 			return d.claimErr
 		},
 		Chat: func(ctx context.Context, msgs []action.Message, temp float64) (string, error) {
@@ -60,7 +73,13 @@ func (d *deps) testDeps() Deps {
 			}
 			return d.injectErr
 		},
-		Served: func(time.Duration) bool { d.servedCall = true; return d.servedYes },
+		Served: func(time.Duration) bool {
+			d.servedCall = true
+			d.servedCalls++
+			return d.servedYes
+		},
+		Hold: func(dur time.Duration) { d.holds = append(d.holds, dur) },
+		Owns: func() bool { return !d.notOwns },
 		Choose: func(items []string) (string, error) {
 			d.chooseCalled = true
 			d.chooseItems = items
@@ -79,7 +98,7 @@ func run(t *testing.T, d *deps, args ...string) (int, string, string) {
 // --- M2 injection flow ---
 
 func TestM2CaptureFallbackInjectsCtrlC(t *testing.T) {
-	d := &deps{primary: "", clipboard: "copied via ctrl c", chatOut: "c"}
+	d := &deps{primary: "", clipboard: "copied via ctrl c", chatOut: "c", servedYes: true}
 	code, _, _ := run(t, d, "proofread")
 	if code != ExitOK {
 		t.Fatalf("exit=%d", code)
@@ -187,7 +206,7 @@ func TestNilDepsGuard(t *testing.T) {
 }
 
 func TestHappyPath(t *testing.T) {
-	d := &deps{primary: "teh quick brown fox", chatOut: "The quick brown fox."} //nolint:misspell // intentional typo: proofread input
+	d := &deps{primary: "teh quick brown fox", chatOut: "The quick brown fox.", servedYes: true} //nolint:misspell // intentional typo: proofread input
 	code, _, errb := run(t, d, "proofread")
 	if code != ExitOK {
 		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitOK, errb)
@@ -205,7 +224,7 @@ func TestHappyPath(t *testing.T) {
 }
 
 func TestCleanAppliedToResult(t *testing.T) {
-	d := &deps{primary: "x", chatOut: "Here is the corrected text:\n\nfixed x"}
+	d := &deps{primary: "x", chatOut: "Here is the corrected text:\n\nfixed x", servedYes: true}
 	code, _, _ := run(t, d, "proofread")
 	if code != ExitOK || d.lastClaim() != "fixed x" {
 		t.Fatalf("exit=%d claimed=%q", code, d.lastClaim())
@@ -213,7 +232,7 @@ func TestCleanAppliedToResult(t *testing.T) {
 }
 
 func TestEmptySelectionFallsBackToClipboard(t *testing.T) {
-	d := &deps{primary: "", clipboard: "from clipboard", chatOut: "c"}
+	d := &deps{primary: "", clipboard: "from clipboard", chatOut: "c", servedYes: true}
 	code, _, _ := run(t, d, "shorten")
 	if code != ExitOK || !d.chatCalled {
 		t.Fatalf("exit=%d chatCalled=%v", code, d.chatCalled)
@@ -299,7 +318,7 @@ func TestTooLargeSelection(t *testing.T) {
 // --- M3 palette (pick) ---
 
 func TestPickRunsChosenAction(t *testing.T) {
-	d := &deps{primary: "x", chatOut: "R",
+	d := &deps{primary: "x", chatOut: "R", servedYes: true,
 		chooseLine: "casual" + action.PaletteSeparator + "Rewrite in a friendly conversational tone"}
 	code, _, errb := run(t, d, "pick")
 	if code != ExitOK {
@@ -314,7 +333,7 @@ func TestPickRunsChosenAction(t *testing.T) {
 }
 
 func TestPickListsAllActions(t *testing.T) {
-	d := &deps{primary: "x", chatOut: "R",
+	d := &deps{primary: "x", chatOut: "R", servedYes: true,
 		chooseLine: "proofread" + action.PaletteSeparator + "Fix spelling, grammar and punctuation, keep the voice"}
 	code, _, _ := run(t, d, "pick")
 	if code != ExitOK {
@@ -420,5 +439,138 @@ func TestNoRestoreWhenNothingClobbered(t *testing.T) {
 	}
 	if len(d.claims) != 0 {
 		t.Fatalf("claims=%v, want none (clipboard was never touched)", d.claims)
+	}
+}
+
+// --- delivery race: never leave a dead owner behind a pending fetch ---
+//
+// The clear-text bug: the app's clipboard fetch lands after the one-shot
+// exits -> the compositor has a dead offer -> the late paste writes an
+// EMPTY string over the selection. Fix: keep the claim alive (serving)
+// until the fetch is observed, retry the keystroke once (palette-close
+// focus transitions swallow the first Ctrl+V), and only then restore.
+
+func withTinyDeliveryWaits(t *testing.T) {
+	t.Helper()
+	s1, s2 := pasteServeWindow, pasteHoldWindow
+	pasteServeWindow, pasteHoldWindow = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { pasteServeWindow, pasteHoldWindow = s1, s2 })
+}
+
+func TestDeliveryRetriesCtrlVWhenNeverServed(t *testing.T) {
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "R", servedYes: false}
+	code, _, errb := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d stderr=%q", code, errb)
+	}
+	// Two Ctrl+V injections: original + one retry when nobody fetched.
+	nv := 0
+	for _, c := range d.combos {
+		if len(c) == 2 && c[1] == 47 {
+			nv++
+		}
+	}
+	if nv != 2 {
+		t.Fatalf("combos=%v, want two Ctrl+V", d.combos)
+	}
+	if d.servedCalls != 2 {
+		t.Fatalf("served waits=%d, want 2 (initial + post-retry)", d.servedCalls)
+	}
+	if len(d.holds) != 1 {
+		t.Fatalf("holds=%v, want one grace hold", d.holds)
+	}
+	if len(d.claims) != 2 || d.claims[1] != "user clip" {
+		t.Fatalf("claims=%v, want restore only after the hold", d.claims)
+	}
+	if !strings.Contains(errb, "clipboard") {
+		t.Fatalf("unserved delivery must warn the user: %q", errb)
+	}
+}
+
+func TestDeliveryNoRetryWhenServedFirstWindow(t *testing.T) {
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "R", servedYes: true}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if d.servedCalls != 1 {
+		t.Fatalf("served waits=%d, want 1 (served immediately, no retry)", d.servedCalls)
+	}
+	nv := 0
+	for _, c := range d.combos {
+		if len(c) == 2 && c[1] == 47 {
+			nv++
+		}
+	}
+	if nv != 1 {
+		t.Fatalf("combos=%v, want exactly one Ctrl+V (no double paste)", d.combos)
+	}
+}
+
+func TestDeliveryAlwaysHoldsClaimBeforeRestore(t *testing.T) {
+	// The clear-text regression test: even when served=true (which a
+	// history watcher satisfies instantly, NOT the paste target), the
+	// claim must be held for the grace window BEFORE the restore claim
+	// and before exit, so a slow app's late fetch still gets the
+	// result instead of a dead owner.
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "R", servedYes: true}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.holds) != 1 || d.holds[0] != pasteHoldWindow {
+		t.Fatalf("holds=%v, want one grace hold of %v", d.holds, pasteHoldWindow)
+	}
+	if len(d.claims) != 2 || d.claims[0] != "R" || d.claims[1] != "user clip" {
+		t.Fatalf("claims=%v, want result then restore", d.claims)
+	}
+}
+
+func TestRestoreSkippedWhenSuperseded(t *testing.T) {
+	// Repeated actions on the same selection: a NEWER needle-writes
+	// claimed the clipboard while this run held. Restoring the old
+	// clipboard now would clobber the newer result and re-open the
+	// dead-owner window for its paste target. Skip the restore.
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "R",
+		servedYes: true, notOwns: true, afterClaimClip: "newer-run-result"}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "R" {
+		t.Fatalf("claims=%v, want the result only — no restore over a newer claim", d.claims)
+	}
+}
+
+func TestDeliveryWatcherReOwnsStillRestores(t *testing.T) {
+	// The normal path on this machine: the Ryoku history watcher
+	// re-owns our claim (source cancelled, SAME text). The content
+	// check must recognize our own text and restore as contracted.
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "R", servedYes: true, notOwns: true}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 2 || d.claims[0] != "R" || d.claims[1] != "user clip" {
+		t.Fatalf("claims=%v, want result then restore (watcher re-owns our own text)", d.claims)
+	}
+}
+
+func TestCancelRestoreProceedsWhenWatcherReOwns(t *testing.T) {
+	// Abort path with the watcher re-owning the Ctrl+C copy: content
+	// equals our captured selection, so the restore must proceed.
+	d := &deps{primary: "", clipboard: "user clip", afterCtrlC: "selection copy",
+		chooseLine: "", notOwns: true}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitCancelled {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "user clip" {
+		t.Fatalf("claims=%v, want the original clipboard restored", d.claims)
 	}
 }

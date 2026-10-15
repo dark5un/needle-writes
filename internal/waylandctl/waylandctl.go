@@ -222,10 +222,13 @@ func (c *Client) dispatch(ev msg) {
 		len(ev.data) >= 4 && client.Uint32(ev.data[:4]) == 0 {
 		if ev.opcode == 1 {
 			c.destroySuperseded(c.cbOffer, nil)
-			c.cbOffer, c.cbSeq, c.cbClaim = nil, c.cbSeq+1, ""
+			// Clear our tracked claim+source too: an external
+			// selection event means we no longer own, even if the
+			// cancelled event for our source has not arrived yet.
+			c.cbOffer, c.cbSeq, c.cbClaim, c.cbClaimSrc = nil, c.cbSeq+1, "", nil
 		} else {
 			c.destroySuperseded(c.prOffer, nil)
-			c.prOffer, c.prSeq, c.prClaim = nil, c.prSeq+1, ""
+			c.prOffer, c.prSeq, c.prClaim, c.prClaimSrc = nil, c.prSeq+1, "", nil
 		}
 		for _, fd := range ev.fds {
 			_ = closeFD(fd)
@@ -355,11 +358,11 @@ func (c *Client) setup() error {
 		})
 		dev.SetSelectionHandler(func(e ext_data_control.DataControlDeviceSelectionEvent) {
 			c.destroySuperseded(c.cbOffer, e.Id)
-			c.cbOffer, c.cbSeq, c.cbClaim = e.Id, c.cbSeq+1, ""
+			c.cbOffer, c.cbSeq, c.cbClaim, c.cbClaimSrc = e.Id, c.cbSeq+1, "", nil
 		})
 		dev.SetPrimarySelectionHandler(func(e ext_data_control.DataControlDevicePrimarySelectionEvent) {
 			c.destroySuperseded(c.prOffer, e.Id)
-			c.prOffer, c.prSeq, c.prClaim = e.Id, c.prSeq+1, ""
+			c.prOffer, c.prSeq, c.prClaim, c.prClaimSrc = e.Id, c.prSeq+1, "", nil
 		})
 		dev.SetFinishedHandler(func(ext_data_control.DataControlDeviceFinishedEvent) { c.devDone = true })
 		// The compositor flushes the current selections to the new device
@@ -854,6 +857,31 @@ func (c *Client) WaitClaimServed(timeout time.Duration) bool {
 		}
 	})
 	return served
+}
+
+// PumpFor keeps the client alive and servicing reader fetches for the
+// given duration (the paste-target grace window after a claim: a slow
+// app's late send request must meet a LIVE source, never a dead owner).
+func (c *Client) PumpFor(d time.Duration) {
+	_ = c.do(func() error {
+		// pred never true: pump processes events until the deadline.
+		return c.pump(func() bool { return false }, d)
+	})
+}
+
+// OwnsClipboard reports whether our latest CLIPBOARD claim is still
+// current — the cancelled handler clears it the moment any other
+// client (including a newer needle-writes run) takes the selection.
+// Restore paths must skip when this is false: claiming over a newer
+// run's result clobbers it and re-opens the dead-owner empty-paste
+// race for that run's paste target.
+func (c *Client) OwnsClipboard() bool {
+	owns := false
+	_ = c.do(func() error {
+		owns = c.cbClaimSrc != nil
+		return nil
+	})
+	return owns
 }
 
 // Close tears down the connection. Any clipboard claims die with it.

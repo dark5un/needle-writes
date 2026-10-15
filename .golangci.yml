@@ -1,4 +1,7 @@
 version: "2"
+run:
+  build-tags:
+    - live
 linters:
   default: standard
   enable:
@@ -9,3 +12,15 @@ linters:
     - unused
     - misspell
     - gocritic
+    - gosec
+    - errorlint
+    - copyloopvar
+    - nilerr
+    - noctx
+    - makezero
+  settings:
+    govet:
+      enable-all: true
+      settings:
+        shadow:
+          strict: true

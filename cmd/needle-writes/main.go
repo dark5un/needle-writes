@@ -35,8 +35,8 @@ const (
 	// naming the tool is not enough).
 	palettePrompt = "rewrite selection: "
 	// paletteWidthChars fits the longest padded item line without
-	// mid-word truncation (12 name + 3 separator + 53 description).
-	paletteWidthChars = 70
+	// mid-word truncation; pinned to the registry's own budget.
+	paletteWidthChars = action.PaletteLineWidth
 )
 
 func main() {

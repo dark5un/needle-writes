@@ -46,6 +46,8 @@ needle-writes casual
 needle-writes summarize
 needle-writes translate-en
 needle-writes translate-el
+needle-writes agentify    # rough text -> clear agent prompt
+needle-writes agentify+   # ...expanded: context, steps, acceptance criteria
 needle-writes -list  # list actions
 ```
 

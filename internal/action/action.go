@@ -78,6 +78,18 @@ var builtins = []Action{
 		Temperature:  0.3,
 		SystemPrompt: "Translate the user's text into natural Modern Greek. " + onlyText,
 	},
+	{
+		Name:         "agentify",
+		Description:  "Rewrite as a clear, direct prompt for an AI agent",
+		Temperature:  0.4,
+		SystemPrompt: "You convert the user's rough notes, dictation, or draft prompt into a clear, direct instruction for an AI agent. Capture the intent exactly: remove filler and ambiguity, keep every requirement, and phrase it as concise imperative prose. Do NOT add steps, scope, or detail the user did not imply or clearly need. Always write the result in English, translating when the input is another language. " + onlyText,
+	},
+	{
+		Name:         "agentify+",
+		Description:  "Full agent brief: context, steps, acceptance criteria",
+		Temperature:  0.6,
+		SystemPrompt: "You convert the user's rough notes, dictation, or draft prompt into a well-structured instruction for an AI agent. First capture the intent exactly and resolve ambiguity. Then EXPAND it into a complete brief: the goal, relevant context and constraints, concrete steps or deliverables, and acceptance criteria that make the finished result verifiable. Keep the expansion faithful to what the user implied — never invent unrelated requirements. Always write the result in English, translating when the input is another language. " + onlyText,
+	},
 }
 
 // List returns the built-in action names in order.
@@ -92,6 +104,11 @@ func List() []string {
 // PaletteSeparator separates the action name from its description on
 // palette display lines (M3).
 const PaletteSeparator = " — "
+
+// PaletteLineWidth is the rendered width budget for palette lines:
+// every PaletteItems() line must fit it (no mid-word truncation, UX
+// review round 3). The palette adapter opens fuzzel at this width.
+const PaletteLineWidth = 70
 
 // paletteNameWidth pads every action name so the separator and the
 // descriptions form aligned columns (monospace palette font).

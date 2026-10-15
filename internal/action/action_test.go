@@ -10,10 +10,54 @@ func TestListReturnsBuiltinActions(t *testing.T) {
 	want := []string{
 		"proofread", "shorten", "professional", "casual",
 		"summarize", "translate-en", "translate-el",
+		"agentify", "agentify+",
 	}
 	got := List()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("List() = %v, want %v", got, want)
+	}
+}
+
+func TestAgentifyActionsRegistered(t *testing.T) {
+	// User-requested agentic-work conversions: clarify, and clarify+expand.
+	for _, name := range []string{"agentify", "agentify+"} {
+		a, err := Get(name)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", name, err)
+		}
+		if a.SystemPrompt == "" || a.Description == "" {
+			t.Fatalf("%s missing prompt or description", name)
+		}
+		if a.Temperature < 0 || a.Temperature > 2 {
+			t.Fatalf("%s temperature out of range: %f", name, a.Temperature)
+		}
+	}
+	// The expand variant must instruct expansion AND forbid
+	// invention (reviewer round: pin the faithfulness clauses).
+	plus, _ := Get("agentify+")
+	lowPlus := strings.ToLower(plus.SystemPrompt)
+	if !strings.Contains(lowPlus, "acceptance") || !strings.Contains(lowPlus, "never invent") {
+		t.Fatalf("agentify+ prompt must ask for verifiable structure and forbid invention: %q", plus.SystemPrompt)
+	}
+	// The plain variant must stay faithful (no invented scope) and
+	// pin the output language.
+	plain, _ := Get("agentify")
+	lowPlain := strings.ToLower(plain.SystemPrompt)
+	if !strings.Contains(lowPlain, "do not add") {
+		t.Fatalf("agentify prompt must forbid invented scope: %q", plain.SystemPrompt)
+	}
+	if !strings.Contains(lowPlain, "english") {
+		t.Fatalf("agentify prompt must pin the output language: %q", plain.SystemPrompt)
+	}
+}
+
+func TestPaletteItemsFitWidth(t *testing.T) {
+	// UX review constraint: -w 70 must fit every line without
+	// truncation — guard so new actions cannot silently overflow.
+	for _, it := range PaletteItems() {
+		if r := []rune(it); len(r) > PaletteLineWidth {
+			t.Errorf("palette line %d runes exceeds width budget %d: %q", len(r), PaletteLineWidth, it)
+		}
 	}
 }
 

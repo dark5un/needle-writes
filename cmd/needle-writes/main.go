@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/dark5un/needle-writes/internal/action"
 	"github.com/dark5un/needle-writes/internal/command"
+	"github.com/dark5un/needle-writes/internal/palette"
 	"github.com/dark5un/needle-writes/internal/strata"
 	"github.com/dark5un/needle-writes/internal/waylandctl"
 )
@@ -25,11 +27,45 @@ const (
 	keyEnvVar      = "NEEDLE_API_KEY"
 	urlEnvVar      = "NEEDLE_STRATA_URL"
 	modelEnvVar    = "NEEDLE_MODEL"
+	// ryokuColorsPath is the live desktop palette (matugen, written by
+	// the ryoku-shell daemon). Read at runtime for the palette's
+	// selection colors; absence just means fuzzel's own defaults.
+	ryokuColorsPath = ".cache/ryoku/colors.json"
+	// palettePrompt states the operation and its target (UX review:
+	// naming the tool is not enough).
+	palettePrompt = "rewrite selection: "
+	// paletteWidthChars fits the longest padded item line without
+	// mid-word truncation (12 name + 3 separator + 53 description).
+	paletteWidthChars = 70
 )
 
 func main() {
 	args, hold := extractHold(os.Args[1:])
 	os.Exit(run(args, hold))
+}
+
+// themeSelection returns the live desktop palette's selection colors
+// (background, text) for the fuzzel palette, read at runtime from the
+// matugen colors file the ryoku-shell daemon writes. Any failure
+// (missing file, unknown shape) yields empty strings: fuzzel's own
+// defaults, never a crash — the picker must work on any compositor.
+func themeSelection() (bg, text string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", ""
+	}
+	// #nosec G304 -- ryokuColorsPath is a compile-time constant under
+	// $HOME; only the home directory itself is variable.
+	f, err := os.Open(filepath.Join(home, ryokuColorsPath))
+	if err != nil {
+		return "", ""
+	}
+	defer func() { _ = f.Close() }()
+	var colors map[string]string
+	if json.NewDecoder(f).Decode(&colors) != nil {
+		return "", ""
+	}
+	return colors["primaryContainer"], colors["onPrimaryContainer"]
 }
 
 // extractHold pulls a "-hold <duration>" pair off the args at any
@@ -76,12 +112,24 @@ func run(args []string, hold time.Duration) int {
 	}
 	client := strata.New(endpoint, key, model)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second) // one explicit budget for the whole one-shot
+	defer cancel()
+
 	deps := command.Deps{
 		ReadPrimary: wl.ReadPrimary,
 		ReadClip:    wl.ReadClipboard,
 		Claim:       wl.ClaimClipboard,
 		Inject:      wl.PressCombo,
 		Served:      func(d time.Duration) bool { return wl.WaitClaimServed(d) },
+		Choose: func(items []string) (string, error) {
+			selBg, selTx := themeSelection()
+			return palette.Fuzzel(ctx, palette.Options{
+				Prompt:              palettePrompt,
+				WidthChars:          paletteWidthChars,
+				SelectionBackground: selBg,
+				SelectionText:       selTx,
+			}, items)
+		},
 		Chat: func(ctx context.Context, msgs []action.Message, temperature float64) (string, error) {
 			sm := make([]strata.Message, len(msgs))
 			for i, m := range msgs {
@@ -90,8 +138,6 @@ func run(args []string, hold time.Duration) int {
 			return client.Chat(ctx, sm, temperature)
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second) // one explicit budget for the whole one-shot
-	defer cancel()
 	code := command.Run(ctx, args, os.Stdout, os.Stderr, deps)
 	if code == command.ExitOK && hold > 0 {
 		// Stay alive serving the claim so a manual Ctrl+V can land it.

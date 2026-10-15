@@ -1,6 +1,39 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestThemeSelection(t *testing.T) {
+	// Point HOME at a temp tree with a matugen-style colors.json.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if bg, tx := themeSelection(); bg != "" || tx != "" {
+		t.Fatalf("missing colors file must yield fuzzel defaults, got %q %q", bg, tx)
+	}
+	path := filepath.Join(home, ryokuColorsPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	colors := map[string]string{"primaryContainer": "#264777", "onPrimaryContainer": "#d6e3ff"}
+	raw, _ := json.Marshal(colors)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if bg, tx := themeSelection(); bg != "#264777" || tx != "#d6e3ff" {
+		t.Fatalf("theme colors not read: %q %q", bg, tx)
+	}
+	// Corrupt file: defaults, not a crash.
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if bg, tx := themeSelection(); bg != "" || tx != "" {
+		t.Fatalf("corrupt colors file must yield defaults, got %q %q", bg, tx)
+	}
+}
 
 func TestExtractHold(t *testing.T) {
 	cases := []struct {

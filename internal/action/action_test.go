@@ -37,6 +37,51 @@ func TestGetUnknownAction(t *testing.T) {
 	}
 }
 
+func TestPaletteItems(t *testing.T) {
+	// M3: one display line per built-in, padded name + separator +
+	// description, same order, columns aligned (UX review).
+	items := PaletteItems()
+	names := List()
+	if len(items) != len(names) {
+		t.Fatalf("items=%d names=%d", len(items), len(names))
+	}
+	for i, it := range items {
+		if !strings.HasPrefix(it, names[i]) {
+			t.Errorf("item %d = %q, want name prefix %q", i, it, names[i])
+		}
+		if got := strings.Index(it, PaletteSeparator); got != paletteNameWidth {
+			t.Errorf("item %d: separator at column %d, want %d (aligned columns): %q", i, got, paletteNameWidth, it)
+		}
+		a, _ := Get(names[i])
+		if !strings.HasSuffix(it, a.Description) {
+			t.Errorf("item %d = %q, want suffix description %q", i, it, a.Description)
+		}
+	}
+}
+
+func TestParsePaletteItem(t *testing.T) {
+	a, err := ParsePaletteItem("casual" + PaletteSeparator + "Rewrite in a friendly conversational tone")
+	if err != nil || a.Name != "casual" || a.SystemPrompt == "" {
+		t.Fatalf("full item: a=%+v err=%v", a, err)
+	}
+	// Padded display line (what PaletteItems actually emits).
+	a, err = ParsePaletteItem("casual      " + PaletteSeparator + "Rewrite in a friendly conversational tone")
+	if err != nil || a.Name != "casual" {
+		t.Fatalf("padded item: a=%+v err=%v", a, err)
+	}
+	// A bare valid name is accepted too (user echo of a filtered line).
+	a, err = ParsePaletteItem("proofread")
+	if err != nil || a.Name != "proofread" {
+		t.Fatalf("bare name: a=%+v err=%v", a, err)
+	}
+	if _, perr := ParsePaletteItem("bogus" + PaletteSeparator + "whatever"); !errors.Is(perr, ErrUnknownAction) {
+		t.Fatalf("unknown item: err=%v, want ErrUnknownAction", perr)
+	}
+	if _, perr := ParsePaletteItem("   "); !errors.Is(perr, ErrUnknownAction) {
+		t.Fatalf("blank item: err=%v, want ErrUnknownAction", perr)
+	}
+}
+
 func TestBuildMessagesEmptySelectionRejected(t *testing.T) {
 	for _, s := range []string{"", "   ", "\n\t "} {
 		_, err := BuildMessages("proofread", s)

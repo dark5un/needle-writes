@@ -89,6 +89,35 @@ func List() []string {
 	return names
 }
 
+// PaletteSeparator separates the action name from its description on
+// palette display lines (M3).
+const PaletteSeparator = " — "
+
+// paletteNameWidth pads every action name so the separator and the
+// descriptions form aligned columns (monospace palette font).
+const paletteNameWidth = 12 // longest built-in name ("professional", "translate-en")
+
+// PaletteItems returns one display line per built-in action, in List()
+// order: "name<pad> — description", columns aligned.
+func PaletteItems() []string {
+	items := make([]string, 0, len(builtins))
+	for _, a := range builtins {
+		items = append(items, fmt.Sprintf("%-*s%s%s", paletteNameWidth, a.Name, PaletteSeparator, a.Description))
+	}
+	return items
+}
+
+// ParsePaletteItem resolves a palette line to its Action: the part
+// before the separator names the action (a bare name is also accepted).
+// The name must exist in the registry.
+func ParsePaletteItem(line string) (Action, error) {
+	name := line
+	if i := strings.Index(line, PaletteSeparator); i >= 0 {
+		name = line[:i]
+	}
+	return Get(strings.TrimSpace(name))
+}
+
 // Get returns the action with the given name.
 func Get(name string) (Action, error) {
 	for _, a := range builtins {

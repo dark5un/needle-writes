@@ -34,10 +34,11 @@ third-party runtime with keyboard-level privileges.
   a single Ctrl+V combo (virtual keyboard); the user's clipboard is
   restored afterwards. Never pastes on an empty capture.
 
-## Usage (target UX; being built)
+## Usage
 
 ```
-SUPER+SHIFT+O        # palette (planned)
+SUPER+SHIFT+O        # palette: capture selection, pick an action, result pasted back
+needle-writes pick   # the palette subcommand
 needle-writes proofread
 needle-writes shorten
 needle-writes professional
@@ -45,7 +46,12 @@ needle-writes casual
 needle-writes summarize
 needle-writes translate-en
 needle-writes translate-el
+needle-writes -list  # list actions
 ```
+
+Direct action binds are still possible (one `bind` per action); the
+palette is the one-key path. v0 palette is fuzzel; a native layer-shell
+palette is planned.
 
 ## Exit codes
 
@@ -55,15 +61,16 @@ needle-writes translate-el
 | 1 | Engine call failed or returned an empty result (nothing pasted) |
 | 2 | Nothing selected — select or copy text first (nothing pasted) |
 | 3 | Selection larger than the model budget |
-| 4 | Wayland/compositor failure (selection, claim, or injection) |
+| 4 | Wayland/compositor failure (selection, claim, injection, or palette) |
+| 5 | Palette dismissed (Esc) — nothing pasted |
 | 64 | Usage error |
 
 ## Status
 
-M0 (pure-Go selection read/claim), M1 (Strata round-trip) and M2
+M0 (pure-Go selection read/claim), M1 (Strata round-trip), M2
 (virtual-keyboard Ctrl+C capture fallback + Ctrl+V delivery with
-clipboard restore) are implemented. Roadmap:
-`~/Documents/plans/writing-tools-plan.md`.
+clipboard restore) and M3-v0 (fuzzel action palette via `pick`) are
+implemented. Roadmap: `~/Documents/plans/writing-tools-plan.md`.
 
 ## Development
 

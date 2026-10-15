@@ -13,20 +13,24 @@ import (
 
 // fake deps: capture seams instead of a live compositor/engine.
 type deps struct {
-	primaryErr error
-	claimErr   error
-	chatErr    error
-	injectErr  error
-	primary    string
-	clipboard  string
-	chatOut    string
-	afterCtrlC string
-	claims     []string
-	chatMsgs   []action.Message
-	combos     [][]uint32
-	chatCalled bool
-	servedYes  bool
-	servedCall bool
+	primaryErr   error
+	claimErr     error
+	chatErr      error
+	injectErr    error
+	chooseErr    error
+	primary      string
+	clipboard    string
+	chatOut      string
+	afterCtrlC   string
+	chooseLine   string
+	claims       []string
+	chatMsgs     []action.Message
+	combos       [][]uint32
+	chooseItems  []string
+	chatCalled   bool
+	chooseCalled bool
+	servedYes    bool
+	servedCall   bool
 }
 
 func (d *deps) lastClaim() string {
@@ -57,6 +61,11 @@ func (d *deps) testDeps() Deps {
 			return d.injectErr
 		},
 		Served: func(time.Duration) bool { d.servedCall = true; return d.servedYes },
+		Choose: func(items []string) (string, error) {
+			d.chooseCalled = true
+			d.chooseItems = items
+			return d.chooseLine, d.chooseErr
+		},
 	}
 }
 
@@ -284,5 +293,132 @@ func TestTooLargeSelection(t *testing.T) {
 	code, _, _ := run(t, d, "proofread")
 	if code != ExitTooLarge {
 		t.Fatalf("exit = %d, want %d", code, ExitTooLarge)
+	}
+}
+
+// --- M3 palette (pick) ---
+
+func TestPickRunsChosenAction(t *testing.T) {
+	d := &deps{primary: "x", chatOut: "R",
+		chooseLine: "casual" + action.PaletteSeparator + "Rewrite in a friendly conversational tone"}
+	code, _, errb := run(t, d, "pick")
+	if code != ExitOK {
+		t.Fatalf("exit=%d stderr=%q", code, errb)
+	}
+	if !strings.Contains(d.chatMsgs[0].Content, "friendly, conversational") {
+		t.Fatalf("system prompt is not the casual one: %q", d.chatMsgs[0].Content)
+	}
+	if d.lastClaim() != "R" {
+		t.Fatalf("claims=%v", d.claims)
+	}
+}
+
+func TestPickListsAllActions(t *testing.T) {
+	d := &deps{primary: "x", chatOut: "R",
+		chooseLine: "proofread" + action.PaletteSeparator + "Fix spelling, grammar and punctuation, keep the voice"}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.chooseItems) != len(action.List()) {
+		t.Fatalf("palette items=%d, want %d", len(d.chooseItems), len(action.List()))
+	}
+}
+
+func TestPickCapturesBeforePalette(t *testing.T) {
+	// Nothing selected: abort BEFORE opening the palette — the user
+	// should not pick an action only to be told to select text.
+	d := &deps{primary: "", clipboard: ""}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitNoSelection {
+		t.Fatalf("exit=%d, want %d", code, ExitNoSelection)
+	}
+	if d.chooseCalled {
+		t.Fatal("palette must not open on empty capture")
+	}
+}
+
+func TestPickCancelExitsCancelled(t *testing.T) {
+	d := &deps{primary: "x", chooseLine: ""}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitCancelled {
+		t.Fatalf("exit=%d, want %d", code, ExitCancelled)
+	}
+	if d.chatCalled || d.lastClaim() != "" {
+		t.Fatal("cancel must not chat or claim")
+	}
+}
+
+func TestPickUnknownItem(t *testing.T) {
+	d := &deps{primary: "x", chooseLine: "bogus" + action.PaletteSeparator + "nope"}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitUsage {
+		t.Fatalf("exit=%d, want %d", code, ExitUsage)
+	}
+	if d.chatCalled {
+		t.Fatal("unknown item must not reach the engine")
+	}
+}
+
+func TestPickChooseError(t *testing.T) {
+	d := &deps{primary: "x", chooseErr: errors.New("fuzzel not installed")}
+	code, _, errb := run(t, d, "pick")
+	if code != ExitWayland {
+		t.Fatalf("exit=%d, want %d", code, ExitWayland)
+	}
+	if !strings.Contains(errb, "fuzzel not installed") {
+		t.Fatalf("palette error must surface: %q", errb)
+	}
+}
+
+func TestPickWithoutChooseSeam(t *testing.T) {
+	// A Deps set without Choose (palette unavailable): clean usage
+	// error, not a panic.
+	d := (&deps{primary: "x"}).testDeps()
+	d.Choose = nil
+	var out, errb bytes.Buffer
+	code := Run(context.Background(), []string{"pick"}, &out, &errb, d)
+	if code != ExitUsage || !strings.Contains(errb.String(), "palette") {
+		t.Fatalf("exit=%d stderr=%q", code, errb.String())
+	}
+}
+
+func TestPickCancelAfterCtrlCRestoresClipboard(t *testing.T) {
+	// Reviewer finding 1 (round 3): the Ctrl+C fallback clobbers
+	// CLIPBOARD; a palette cancel must put the user's original
+	// clipboard back — cancel is exactly where clean undo is expected.
+	d := &deps{primary: "", clipboard: "user clip", afterCtrlC: "selection copy", chooseLine: ""}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitCancelled {
+		t.Fatalf("exit=%d, want %d", code, ExitCancelled)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "user clip" {
+		t.Fatalf("claims=%v, want the original clipboard restored", d.claims)
+	}
+}
+
+func TestEngineFailureAfterCtrlCRestoresClipboard(t *testing.T) {
+	// Same gap on the pre-existing abort paths: engine failure after
+	// a Ctrl+C capture must restore the clipboard, not leave the copy
+	// of the selection in its place.
+	d := &deps{primary: "", clipboard: "user clip", afterCtrlC: "selection copy", chatErr: errors.New("engine down")}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitEngine {
+		t.Fatalf("exit=%d, want %d", code, ExitEngine)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "user clip" {
+		t.Fatalf("claims=%v, want the original clipboard restored", d.claims)
+	}
+}
+
+func TestNoRestoreWhenNothingClobbered(t *testing.T) {
+	// PRIMARY present: no Ctrl+C, no clobber, no restore claim on cancel.
+	d := &deps{primary: "x", clipboard: "user clip", chooseLine: ""}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitCancelled {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 0 {
+		t.Fatalf("claims=%v, want none (clipboard was never touched)", d.claims)
 	}
 }

@@ -96,6 +96,43 @@ half-formed prompt, select it, and get back the same intent worded the
 way LLMs follow best — `agentify+` turns it into a full brief with
 verifiable acceptance criteria.
 
+## Ryoku & portability notes
+
+This tool was built and tested on **Ryoku** (Hyprland + the Quickshell
+shell), and it leans on a few Ryoku conveniences — all strictly
+best-effort, so it works on any Hyprland (≥ 0.52) that provides
+`ext-data-control` and `virtual-keyboard`:
+
+- Palette theme colors are read from the shell's live palette file when
+  present; otherwise fuzzel's own defaults apply.
+- The API key comes from `NEEDLE_API_KEY` when set; otherwise, if a
+   local service env file is configured, from there.
+- The clipboard-restore logic is content-aware: it behaves correctly
+  whether or not a clipboard history watcher (the Ryoku shell,
+  `wl-copy -w`, and similar managers re-own every selection) is
+  running.
+
+Other compositors: anything implementing both protocols works in
+principle; only Hyprland is tested.
+
+### Terminal targets
+
+In terminal emulators plain Ctrl+V is **not** paste (kitty and many
+others use Ctrl+Shift+V), and the Ctrl+C capture fallback would send
+SIGINT to the running program. Terminals that set PRIMARY on selection
+(kitty, foot, alacritty…) still capture fine; only the paste combo
+differs. Use a second keybind with terminal combos:
+
+```lua
+-- Lua config (e.g. Ryoku's user.lua)
+hl.bind("SUPER + SHIFT + I", hl.dsp.exec_cmd("needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c"))
+```
+
+```
+# legacy hyprland.conf
+bind = SUPER SHIFT, I, exec, needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c
+```
+
 ## Exit codes
 
 | Code | Meaning |

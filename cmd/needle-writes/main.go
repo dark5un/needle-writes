@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dark5un/needle-writes/internal/action"
@@ -42,6 +43,74 @@ const (
 func main() {
 	args, hold := extractHold(os.Args[1:])
 	os.Exit(run(args, hold))
+}
+
+// parseCombo parses "ctrl+shift+v"-style key specs into evdev keycodes
+// (constants verified against /usr/include/linux/input-event-codes.h).
+func parseCombo(s string) ([]uint32, error) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(s)), "+")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("combo %q needs a modifier and a key, e.g. ctrl+shift+v", s)
+	}
+	mods := map[string]uint32{"ctrl": 29, "shift": 42, "alt": 56}
+	keys := map[string]uint32{
+		"q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22,
+		"i": 23, "o": 24, "p": 25, "a": 30, "s": 31, "d": 32, "f": 33,
+		"g": 34, "h": 35, "j": 36, "k": 37, "l": 38, "z": 44, "x": 45,
+		"c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
+	}
+	out := make([]uint32, 0, len(parts))
+	for i, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("combo %q has an empty part", s)
+		}
+		if i == len(parts)-1 {
+			code, ok := keys[p]
+			if !ok {
+				return nil, fmt.Errorf("combo %q: unsupported key %q (a-z)", s, p)
+			}
+			out = append(out, code)
+			continue
+		}
+		code, ok := mods[p]
+		if !ok {
+			return nil, fmt.Errorf("combo %q: unsupported modifier %q (ctrl/shift/alt)", s, p)
+		}
+		out = append(out, code)
+	}
+	return out, nil
+}
+
+// extractCombos pulls --paste/--copy <combo> flags off the args at any
+// position (terminals need ctrl+shift+v to paste and ctrl+shift+c to
+// copy: plain Ctrl+V is not paste there, and plain Ctrl+C is SIGINT
+// to the running program).
+func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32, err error) {
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--paste" && args[i] != "--copy" {
+			rest = append(rest, args[i])
+			continue
+		}
+		val := ""
+		if i+1 < len(args) {
+			val = args[i+1]
+		}
+		if val == "" {
+			return nil, nil, nil, fmt.Errorf("%s needs a value like ctrl+shift+v", args[i])
+		}
+		codes, cerr := parseCombo(val)
+		if cerr != nil {
+			return nil, nil, nil, cerr
+		}
+		if args[i] == "--paste" {
+			pasteCombo = codes
+		} else {
+			copyCombo = codes
+		}
+		i++
+	}
+	return rest, pasteCombo, copyCombo, nil
 }
 
 // themeSelection returns the live desktop palette's selection colors
@@ -85,6 +154,11 @@ func extractHold(args []string) ([]string, time.Duration) {
 }
 
 func run(args []string, hold time.Duration) int {
+	args, pasteCombo, copyCombo, cerr := extractCombos(args)
+	if cerr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: %v\n", cerr)
+		return command.ExitUsage
+	}
 	wl, err := waylandctl.Connect()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: wayland: %v\n", err)
@@ -120,6 +194,8 @@ func run(args []string, hold time.Duration) int {
 		ReadClip:    wl.ReadClipboard,
 		Claim:       wl.ClaimClipboard,
 		Inject:      wl.PressCombo,
+		CopyCombo:   copyCombo,
+		PasteCombo:  pasteCombo,
 		Served:      func(d time.Duration) bool { return wl.WaitClaimServed(d) },
 		Hold:        func(d time.Duration) { wl.PumpFor(d) },
 		Owns:        wl.OwnsClipboard,

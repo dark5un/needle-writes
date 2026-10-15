@@ -29,6 +29,8 @@ type deps struct {
 	combos         [][]uint32
 	chooseItems    []string
 	holds          []time.Duration
+	pasteCombo     []uint32
+	copyCombo      []uint32
 	chatCalled     bool
 	chooseCalled   bool
 	servedYes      bool
@@ -66,6 +68,8 @@ func (d *deps) testDeps() Deps {
 			d.chatMsgs = msgs
 			return d.chatOut, d.chatErr
 		},
+		PasteCombo: d.pasteCombo,
+		CopyCombo:  d.copyCombo,
 		Inject: func(combo ...uint32) error {
 			d.combos = append(d.combos, combo)
 			if d.injectErr == nil && d.afterCtrlC != "" && len(combo) == 2 && combo[0] == 29 && combo[1] == 46 {
@@ -526,6 +530,50 @@ func TestDeliveryAlwaysHoldsClaimBeforeRestore(t *testing.T) {
 	}
 	if len(d.claims) != 2 || d.claims[0] != "R" || d.claims[1] != "user clip" {
 		t.Fatalf("claims=%v, want result then restore", d.claims)
+	}
+}
+
+// --- custom combos (terminal targets: Ctrl+V is not paste there, and
+// Ctrl+C is SIGINT to the running program) ---
+
+func TestCustomPasteComboUsedForDelivery(t *testing.T) {
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "clip", chatOut: "R", servedYes: true,
+		pasteCombo: []uint32{29, 42, 47}} // ctrl+shift+v (kitty/terminals)
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	found := false
+	for _, c := range d.combos {
+		if len(c) == 3 && c[0] == 29 && c[1] == 42 && c[2] == 47 {
+			found = true
+		}
+		if len(c) == 2 && c[1] == 47 {
+			t.Fatalf("default Ctrl+V used despite PasteCombo override: %v", d.combos)
+		}
+	}
+	if !found {
+		t.Fatalf("combos=%v, want ctrl+shift+v", d.combos)
+	}
+}
+
+func TestCustomCopyComboForCaptureFallback(t *testing.T) {
+	d := &deps{primary: "", clipboard: "copied", chatOut: "c", servedYes: true,
+		copyCombo: []uint32{29, 42, 46}} // ctrl+shift+c: in terminals Ctrl+C would SIGINT the app
+	code, _, _ := run(t, d, "pick")
+	_ = code
+	if len(d.combos) == 0 || len(d.combos[0]) != 3 || d.combos[0][2] != 46 {
+		t.Fatalf("combos=%v, want ctrl+shift+c first", d.combos)
+	}
+}
+
+func TestDefaultCombosUnchanged(t *testing.T) {
+	withTinyDeliveryWaits(t)
+	d := &deps{primary: "x", clipboard: "clip", chatOut: "R", servedYes: true}
+	run(t, d, "proofread")
+	if len(d.combos) != 1 || d.combos[0][0] != 29 || d.combos[0][1] != 47 {
+		t.Fatalf("combos=%v, want default Ctrl+V", d.combos)
 	}
 }
 

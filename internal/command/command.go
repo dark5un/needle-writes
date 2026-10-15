@@ -48,6 +48,12 @@ type Deps struct {
 	// compositor's current one (not superseded by a newer run). nil =
 	// assume still owned.
 	Owns func() bool
+	// CopyCombo/PasteCombo override the capture-fallback and delivery
+	// combos. Terminals need e.g. ctrl+shift+v (plain Ctrl+V is not
+	// paste there) and ctrl+shift+c (plain Ctrl+C is SIGINT to the
+	// running program). nil = the defaults below.
+	CopyCombo  []uint32
+	PasteCombo []uint32
 }
 
 // evdev keycodes for the injection combos.
@@ -68,6 +74,7 @@ var (
 
 func usage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "usage: needle-writes <action> | pick | -list")
+	_, _ = fmt.Fprintln(w, "flags: -hold <dur> | --paste <combo> | --copy <combo>  (e.g. ctrl+shift+v)")
 	_, _ = fmt.Fprint(w, "actions:\n")
 	for _, name := range action.List() {
 		a, _ := action.Get(name)
@@ -107,6 +114,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 			usage(stderr)
 			return ExitUsage
 		}
+	}
+
+	// Combo overrides (terminals: ctrl+shift+c / ctrl+shift+v).
+	copyCombo := d.CopyCombo
+	if copyCombo == nil {
+		copyCombo = CtrlC
+	}
+	pasteCombo := d.PasteCombo
+	if pasteCombo == nil {
+		pasteCombo = CtrlV
 	}
 
 	// Save the user's clipboard BEFORE anything can clobber it (the
@@ -154,8 +171,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	if sel == "" && d.Inject != nil {
 		// M2: no PRIMARY — ask the focused app for a copy, then read
 		// the clipboard (which now carries the selection).
-		if ierr := d.Inject(CtrlC...); ierr != nil {
-			_, _ = fmt.Fprintf(stderr, "needle-writes: Ctrl+C injection failed: %v (falling back to current clipboard)\n", ierr)
+		if ierr := d.Inject(copyCombo...); ierr != nil {
+			_, _ = fmt.Fprintf(stderr, "needle-writes: copy-combo injection failed: %v (falling back to current clipboard)\n", ierr)
 		} else {
 			clobbered = true
 		}
@@ -230,8 +247,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	// restore rule (put savedClip back on any abort) covers delivery.
 	clobbered = true
 	if d.Inject != nil {
-		if ierr := d.Inject(CtrlV...); ierr != nil {
-			_, _ = fmt.Fprintf(stderr, "needle-writes: Ctrl+V injection failed: %v (result stays on the clipboard for manual paste)\n", ierr)
+		if ierr := d.Inject(pasteCombo...); ierr != nil {
+			_, _ = fmt.Fprintf(stderr, "needle-writes: paste-combo injection failed: %v (result stays on the clipboard for manual paste)\n", ierr)
 		} else {
 			// The clear-text bug: the served signal cannot prove the
 			// PASTE TARGET fetched — a clipboard-history watcher (the
@@ -245,7 +262,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 			if !served {
 				// Silent: the keystroke most likely landed during a
 				// focus transition (palette close). One retry.
-				if rerr := d.Inject(CtrlV...); rerr == nil {
+				if rerr := d.Inject(pasteCombo...); rerr == nil {
 					served = d.Served == nil || d.Served(pasteServeWindow)
 				}
 			}

@@ -111,6 +111,12 @@ needle-writes agentify+   # ...expanded: context, steps, acceptance criteria
 needle-writes -list       # list actions
 ```
 
+Flags: `-hold <dur>` (keep the result claim alive for a manual paste),
+`--paste <combo>` / `--copy <combo>` (override the injected combos),
+`--no-paste` (never inject a paste: the result stays on the clipboard
+for you to paste yourself — see Terminal targets). The palette prompt
+states the active delivery mode: `(replace selection)` vs `(to clipboard)`.
+
 Direct action binds are still possible (one `bind` per action); the
 palette is the one-key path. The palette is fuzzel (v0); a native
 layer-shell palette is planned.
@@ -130,8 +136,9 @@ best-effort, so it works on any Hyprland (≥ 0.52) that provides
 - No installation-specific paths are compiled in: the engine endpoint,
   the API-key file, the palette theme file, the prompt and the injection
   combos all come from the config file, and every one of them has a
-  sane default or a graceful fallback (no `theme_file` means fuzzel's
-  own colors).
+  sane default or a graceful fallback (no `theme_file` leaves the
+  surface at fuzzel's own colors, with AA-contrast ink fallbacks
+  applied on top).
 - The clipboard-restore logic is content-aware: it behaves correctly
   whether or not a clipboard history watcher (the Ryoku shell,
   `wl-copy -w`, and similar managers re-own every selection) is
@@ -146,23 +153,41 @@ In terminal emulators plain Ctrl+V is **not** paste (kitty and many
 others use Ctrl+Shift+V), and the Ctrl+C capture fallback would send
 SIGINT to the running program. Terminals that set PRIMARY on selection
 (kitty, foot, alacritty…) still capture fine; only the paste combo
-differs. Use a second keybind with terminal combos:
+differs.
+
+The robust mode for terminals and modal editors (vim changes mode on
+injected keystrokes) is **`--no-paste`**: the result is claimed as
+CLIPBOARD and left there — no keystrokes are injected at all, nothing
+is auto-pasted, and the clipboard is NOT restored (the result is the
+point). Paste it yourself where you want it:
 
 ```lua
 -- Lua config (e.g. Ryoku's user.lua)
-hl.bind("SUPER + SHIFT + I", hl.dsp.exec_cmd("needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c"))
+hl.bind("SUPER + SHIFT + I", hl.dsp.exec_cmd("needle-writes pick --no-paste --copy ctrl+shift+c"))
 ```
 
 ```
 # legacy hyprland.conf
-bind = SUPER SHIFT, I, exec, needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c
+bind = SUPER SHIFT, I, exec, needle-writes pick --no-paste --copy ctrl+shift+c
+```
+
+(`--copy ctrl+shift+c` keeps the empty-PRIMARY capture fallback usable
+in terminals; it is capture, not delivery.) Know the consequences: your
+previous clipboard is gone, and with a clipboard-history manager
+running the result is persisted into that history like any copy.
+Without one, the claim is served live for ~10 s after the result is
+claimed — paste inside that window. If your terminal does take injected
+Ctrl+Shift+V well, the auto-paste form works too:
+
+```
+needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c
 ```
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Result claimed (and pasted via Ctrl+V when injection is available) |
+| 0 | Result claimed (pasted via the paste combo in default mode; left on the clipboard with `--no-paste`) |
 | 1 | Engine call failed or returned an empty result (nothing pasted) |
 | 2 | Nothing selected — select or copy text first (nothing pasted) |
 | 3 | Selection larger than the model budget |

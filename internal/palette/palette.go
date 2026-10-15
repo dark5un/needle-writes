@@ -21,6 +21,11 @@ import (
 // built-in defaults measure ~1.06:1 against its own background).
 type Options struct {
 	Prompt              string
+	Background          string // dmenu window bg; "" = fuzzel default
+	TextColor           string // unselected item text; "" = fuzzel default
+	PromptColor         string // prompt line incl. mode hint; "" = fuzzel default
+	InputColor          string // typed-input color; "" = fuzzel default (UX review: must not fuse with the prompt gray)
+	BorderColor         string // window border; "" = fuzzel default
 	SelectionBackground string // "#rrggbb[aa]"; "" = fuzzel default
 	SelectionText       string // "" = fuzzel default
 	WidthChars          int    // <=0: fuzzel default
@@ -44,11 +49,26 @@ func fuzzelArgs(opts Options, items int) []string {
 		lines = items // every action visible
 	}
 	args = append(args, "-l", strconv.Itoa(lines))
-	if bg := fuzzelColor(opts.SelectionBackground); bg != "" {
-		args = append(args, "-s", bg)
+	if bg := fuzzelColor(opts.Background); bg != "" {
+		args = append(args, "-b", bg)
 	}
-	if tx := fuzzelColor(opts.SelectionText); tx != "" {
-		args = append(args, "-S", tx)
+	if tc := fuzzelColor(opts.TextColor); tc != "" {
+		args = append(args, "-t", tc)
+	}
+	if pc := fuzzelColor(opts.PromptColor); pc != "" {
+		args = append(args, "--prompt-color="+pc)
+	}
+	if ic := fuzzelColor(opts.InputColor); ic != "" {
+		args = append(args, "--input-color="+ic)
+	}
+	if bc := fuzzelColor(opts.BorderColor); bc != "" {
+		args = append(args, "-C", bc)
+	}
+	if sb := fuzzelColor(opts.SelectionBackground); sb != "" {
+		args = append(args, "-s", sb)
+	}
+	if st := fuzzelColor(opts.SelectionText); st != "" {
+		args = append(args, "-S", st)
 	}
 	return args
 }

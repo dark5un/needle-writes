@@ -52,6 +52,44 @@ func TestFuzzelArgsWidthAndSelectionColors(t *testing.T) {
 	}
 }
 
+func TestFuzzelArgsInputAndItemColors(t *testing.T) {
+	// UX review (round: --no-paste modes): typed input must not fuse
+	// with the prompt (both default to the same dim gray), and item
+	// text must clear WCAG AA on the cream background.
+	o := Options{
+		Prompt:     "p: ",
+		InputColor: "#073642",
+		TextColor:  "#586e75",
+	}
+	joined := strings.Join(fuzzelArgs(o, 7), " ")
+	for _, want := range []string{"--input-color=073642ff", "-t 586e75ff"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args must contain %q: %v", want, joined)
+		}
+	}
+	// Empty colors: fuzzel's own defaults, flags omitted.
+	joined = strings.Join(fuzzelArgs(Options{Prompt: "p: "}, 7), " ")
+	if strings.Contains(joined, "input-color") || strings.Contains(joined, "-t ") {
+		t.Errorf("no color flags when unset: %v", joined)
+	}
+}
+
+func TestFuzzelArgsFullThemeSet(t *testing.T) {
+	// Design review: the whole widget themes as one system.
+	o := Options{
+		Prompt: "p: ", Background: "#1d2024", TextColor: "#c4c6cf",
+		PromptColor: "#e2e2e9", InputColor: "#a9c7ff", BorderColor: "#44474e",
+		SelectionBackground: "#264777", SelectionText: "#d6e3ff",
+	}
+	joined := strings.Join(fuzzelArgs(o, 7), " ")
+	for _, want := range []string{"-b 1d2024ff", "-t c4c6cfff", "--prompt-color=e2e2e9ff",
+		"--input-color=a9c7ffff", "-C 44474eff", "-s 264777ff", "-S d6e3ffff"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args must contain %q: %v", want, joined)
+		}
+	}
+}
+
 func TestFuzzelColorNormalization(t *testing.T) {
 	// fuzzel wants rrggbbaa WITHOUT '#'; a bad value makes fuzzel exit
 	// 1 ("invalid color") which we would misread as a user cancel.

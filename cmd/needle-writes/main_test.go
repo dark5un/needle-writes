@@ -4,32 +4,77 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/dark5un/needle-writes/internal/palette"
 )
 
-func TestThemeSelection(t *testing.T) {
-	// "" disables theming: fuzzel defaults, never a crash.
-	if bg, tx := themeSelection(""); bg != "" || tx != "" {
-		t.Fatalf("empty path must yield defaults, got %q %q", bg, tx)
+func TestThemePalette(t *testing.T) {
+	// Design review: one coherent color system per widget. With a
+	// theme file the WHOLE palette (surface, text, prompt, input,
+	// border, selection) comes from the M3 colors.json; without one
+	// (empty path, missing file, corrupt JSON) we fall back to the
+	// Solarized-light set matching fuzzel's built-in cream surface —
+	// never a dark selection bar floating on a cream box.
+	light := themePalette("")
+	if light.Background != "" || light.SelectionBackground != "" {
+		t.Fatalf("no theme must leave surface/selection at fuzzel defaults: %+v", light)
 	}
-	if bg, tx := themeSelection(filepath.Join(t.TempDir(), "missing.json")); bg != "" || tx != "" {
-		t.Fatalf("missing file must yield defaults, got %q %q", bg, tx)
+	if light.TextColor != lightTextFallback || light.InputColor != lightInputFallback {
+		t.Fatalf("no theme must still carry the AA/anti-fusion inks: %+v", light)
+	}
+	if got := themePalette(filepath.Join(t.TempDir(), "missing.json")); got != light {
+		t.Fatalf("missing file must equal the light fallback: %+v", got)
 	}
 	path := filepath.Join(t.TempDir(), "colors.json")
-	colors := map[string]string{"primaryContainer": "#264777", "onPrimaryContainer": "#d6e3ff"}
+	colors := map[string]string{
+		"surfaceContainer": "#1d2024", "onSurfaceVariant": "#c4c6cf",
+		"onSurface": "#e2e2e9", "primary": "#a9c7ff", "outlineVariant": "#44474e",
+		"primaryContainer": "#264777", "onPrimaryContainer": "#d6e3ff",
+	}
 	raw, _ := json.Marshal(colors)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if bg, tx := themeSelection(path); bg != "#264777" || tx != "#d6e3ff" {
-		t.Fatalf("theme colors not read: %q %q", bg, tx)
+	got := themePalette(path)
+	// themeColor normalizes to bare hex (fuzzelColor accepts either).
+	want := palette.Options{
+		Background: "1d2024", TextColor: "c4c6cf", PromptColor: "e2e2e9",
+		InputColor: "a9c7ff", BorderColor: "44474e",
+		SelectionBackground: "264777", SelectionText: "d6e3ff",
 	}
-	// Corrupt file: defaults, not a crash.
+	if got != want {
+		t.Fatalf("theme colors not read: %+v want %+v", got, want)
+	}
+	// Corrupt file: light fallback, not a crash, not a half-themed box.
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if bg, tx := themeSelection(path); bg != "" || tx != "" {
-		t.Fatalf("corrupt colors file must yield defaults, got %q %q", bg, tx)
+	if cg := themePalette(path); cg != light {
+		t.Fatalf("corrupt colors file must yield the light fallback: %+v", cg)
+	}
+	// Partial theme: known keys themed, unknown keys keep the dark-set
+	// defaults (the file's presence declares a dark system).
+	if err := os.WriteFile(path, []byte(`{"primaryContainer":"#ff0000"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = themePalette(path)
+	if got.SelectionBackground != "ff0000" || got.Background != darkBackgroundFallback {
+		t.Fatalf("partial theme wrong: %+v", got)
+	}
+}
+
+func TestThemeColor(t *testing.T) {
+	// matugen emits #aarrggbb; fuzzel wants rrggbbaa.
+	if got := themeColor("#ff1d2024"); got != "1d2024ff" {
+		t.Errorf("ARGB = %q, want 1d2024ff", got)
+	}
+	if got := themeColor("#1d2024"); got != "1d2024" {
+		t.Errorf("RGB = %q, want 1d2024", got)
+	}
+	if got := themeColor("  #264777 "); got != "264777" {
+		t.Errorf("padded = %q", got)
 	}
 }
 
@@ -51,8 +96,44 @@ func TestParseCombo(t *testing.T) {
 	}
 }
 
+func TestPalettePromptMentionsDeliveryMode(t *testing.T) {
+	cases := []struct {
+		base     string
+		mustHave string
+		noPaste  bool
+	}{
+		{"rewrite selection:", "selection", false}, // auto-delivery: says the selection is replaced in place
+		{"rewrite selection:", "clipboard", true},  // --no-paste: says the result lands on the clipboard
+	}
+	for _, c := range cases {
+		got := palettePrompt(c.base, c.noPaste)
+		if !strings.Contains(strings.ToLower(got), c.mustHave) {
+			t.Errorf("palettePrompt(%q, noPaste=%v) = %q, must mention %q", c.base, c.noPaste, got, c.mustHave)
+		}
+		if !strings.HasPrefix(got, c.base) {
+			t.Errorf("palettePrompt must keep the configured base prompt: %q", got)
+		}
+		// The mode hint must read as an annotation, not as typed filter
+		// text: parenthesized, and never starting with an arrow glyph
+		// (UX review round: "-> clipboard" was misread as a query).
+		hint := strings.TrimPrefix(got, c.base)
+		if !strings.HasPrefix(hint, " (") || !strings.HasSuffix(hint, ")") {
+			t.Errorf("mode hint %q must be a parenthetical annotation", hint)
+		}
+	}
+	// The shipped default prompt carries a trailing space: the composed
+	// line must not double up on it.
+	got := palettePrompt("rewrite selection: ", true)
+	if strings.Contains(got, "  ") {
+		t.Errorf("palettePrompt must collapse the base trailing space: %q", got)
+	}
+	if got != "rewrite selection: (to clipboard)" {
+		t.Errorf("composed = %q", got)
+	}
+}
+
 func TestExtractCombos(t *testing.T) {
-	rest, paste, cp, err := extractCombos([]string{"--paste", "ctrl+shift+v", "pick", "--copy", "ctrl+shift+c"})
+	rest, paste, cp, noPaste, err := extractCombos([]string{"--paste", "ctrl+shift+v", "pick", "--copy", "ctrl+shift+c"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,10 +143,17 @@ func TestExtractCombos(t *testing.T) {
 	if len(paste) != 3 || paste[2] != 47 || len(cp) != 3 || cp[2] != 46 {
 		t.Fatalf("paste=%v copy=%v", paste, cp)
 	}
-	if _, _, _, e2 := extractCombos([]string{"--paste", "bogus", "pick"}); e2 == nil {
+	if noPaste {
+		t.Fatal("noPaste must default false")
+	}
+	rest, _, _, noPaste, err = extractCombos([]string{"pick", "--no-paste"})
+	if err != nil || noPaste != true || len(rest) != 1 || rest[0] != "pick" {
+		t.Fatalf("--no-paste: rest=%v noPaste=%v err=%v", rest, noPaste, err)
+	}
+	if _, _, _, _, e2 := extractCombos([]string{"--paste", "bogus", "pick"}); e2 == nil {
 		t.Fatal("bad combo must error")
 	}
-	if _, _, _, e3 := extractCombos([]string{"--paste"}); e3 == nil {
+	if _, _, _, _, e3 := extractCombos([]string{"--paste"}); e3 == nil {
 		t.Fatal("missing value must error")
 	}
 }

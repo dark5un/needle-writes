@@ -29,6 +29,7 @@ type deps struct {
 	combos         [][]uint32
 	chooseItems    []string
 	holds          []time.Duration
+	notifyMsgs     []string
 	pasteCombo     []uint32
 	copyCombo      []uint32
 	chatCalled     bool
@@ -36,6 +37,7 @@ type deps struct {
 	servedYes      bool
 	servedCall     bool
 	notOwns        bool // true: our claim was superseded by a newer run
+	noPaste        bool // --no-paste: leave the result on the clipboard, inject nothing
 	servedCalls    int
 }
 
@@ -82,8 +84,10 @@ func (d *deps) testDeps() Deps {
 			d.servedCalls++
 			return d.servedYes
 		},
-		Hold: func(dur time.Duration) { d.holds = append(d.holds, dur) },
-		Owns: func() bool { return !d.notOwns },
+		Hold:    func(dur time.Duration) { d.holds = append(d.holds, dur) },
+		Owns:    func() bool { return !d.notOwns },
+		NoPaste: d.noPaste,
+		Notify:  func(body string) { d.notifyMsgs = append(d.notifyMsgs, body) },
 		Choose: func(items []string) (string, error) {
 			d.chooseCalled = true
 			d.chooseItems = items
@@ -100,6 +104,116 @@ func run(t *testing.T, d *deps, args ...string) (int, string, string) {
 }
 
 // --- M2 injection flow ---
+
+// --- --no-paste mode (terminal/editor targets: leave the result on the
+// clipboard, never inject a paste) ---
+
+func TestNoPasteClaimsWithoutInjectingOrRestoring(t *testing.T) {
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "RESULT"}
+	d.noPaste = true
+	code, out, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	// Exactly one claim: the result. No clipboard restore — the result
+	// must still be on the clipboard when the user pastes manually.
+	if len(d.claims) != 1 || d.claims[0] != "RESULT" {
+		t.Fatalf("claims = %v, want exactly [RESULT]", d.claims)
+	}
+	// No keystrokes at all: PRIMARY was non-empty, and no paste is sent.
+	if len(d.combos) != 0 {
+		t.Fatalf("combos = %v, want none", d.combos)
+	}
+	if d.servedCall {
+		t.Fatal("Served must not be consulted without a paste injection")
+	}
+	if len(d.holds) == 0 {
+		t.Fatal("the result claim must be held for the manual-paste window")
+	}
+	if d.holds[0] != noPasteHoldWindow {
+		t.Fatalf("hold = %v, want the human-scaled noPasteHoldWindow", d.holds[0])
+	}
+	if out != "RESULT" {
+		t.Fatalf("stdout = %q, want the result", out)
+	}
+}
+
+func TestNoPasteStillUsesCopyFallback(t *testing.T) {
+	// Capture fallback (Ctrl+C) stays available: it is capture, not
+	// delivery. Delivery injects nothing.
+	d := &deps{primary: "", clipboard: "selection copy", chatOut: "RESULT"}
+	d.noPaste = true
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.combos) != 1 || d.combos[0][0] != 29 || d.combos[0][1] != 46 {
+		t.Fatalf("combos = %v, want exactly one Ctrl+C (capture only)", d.combos)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "RESULT" {
+		t.Fatalf("claims = %v, want exactly [RESULT] (no restore)", d.claims)
+	}
+}
+
+func TestNoPasteCancelStillRestoresUserClipboard(t *testing.T) {
+	// Aborts BEFORE delivery keep the old contract: a clobbering
+	// Ctrl+C capture is undone on palette cancel.
+	d := &deps{primary: "", clipboard: "user original", chooseLine: ""}
+	d.noPaste = true
+	code, _, _ := run(t, d, "pick")
+	if code != ExitCancelled {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "user original" {
+		t.Fatalf("claims = %v, want the user clipboard restored", d.claims)
+	}
+}
+
+func TestNoPasteEngineFailureStillRestores(t *testing.T) {
+	// Reviewer round: every pre-delivery abort restores, not just
+	// cancel. Engine failure after a clobbering Ctrl+C capture must
+	// put the user's clipboard back.
+	d := &deps{primary: "", clipboard: "selection copy", chatErr: errors.New("engine down")}
+	d.noPaste = true
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitEngine {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.claims) != 1 || d.claims[0] != "selection copy" {
+		t.Fatalf("claims = %v, want the user clipboard restored", d.claims)
+	}
+	// UX review (clipboard mode): success and failure are otherwise
+	// pixel-identical — the user could paste STALE clipboard content
+	// believing it is the rewrite. Failure must be announced.
+	if len(d.notifyMsgs) != 1 || !strings.Contains(d.notifyMsgs[0], "clipboard unchanged") {
+		t.Fatalf("notifyMsgs = %v, want one 'clipboard unchanged' notice", d.notifyMsgs)
+	}
+}
+
+func TestNoPasteSuccessDoesNotNotify(t *testing.T) {
+	d := &deps{primary: "x", clipboard: "user clip", chatOut: "RESULT"}
+	d.noPaste = true
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitOK {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.notifyMsgs) != 0 {
+		t.Fatalf("notifyMsgs = %v, want none on success", d.notifyMsgs)
+	}
+}
+
+func TestPasteModeFailureDoesNotNotify(t *testing.T) {
+	// Paste mode's failure is observable (the selection is visibly
+	// untouched): no notification noise.
+	d := &deps{primary: "x", clipboard: "user clip", chatErr: errors.New("engine down")}
+	code, _, _ := run(t, d, "proofread")
+	if code != ExitEngine {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.notifyMsgs) != 0 {
+		t.Fatalf("notifyMsgs = %v, want none in paste mode", d.notifyMsgs)
+	}
+}
 
 func TestM2CaptureFallbackInjectsCtrlC(t *testing.T) {
 	d := &deps{primary: "", clipboard: "copied via ctrl c", chatOut: "c", servedYes: true}

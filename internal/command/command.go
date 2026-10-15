@@ -27,33 +27,48 @@ const (
 
 // Deps are the side-effecting seams Run drives.
 type Deps struct {
-	ReadPrimary func() (string, error)
-	ReadClip    func() (string, error)
-	Claim       func(string) error
-	Chat        func(ctx context.Context, msgs []action.Message, temperature float64) (string, error)
+	// Served reports whether the last claim was fetched by a reader
+	// (the paste target), waiting up to timeout. nil = assume served.
+	Served func(timeout time.Duration) bool
+	// ReadClip reads CLIPBOARD.
+	ReadClip func() (string, error)
+	// Claim claims CLIPBOARD with the given text (in-process source;
+	// dies with the process unless a history watcher re-owns it).
+	Claim func(string) error
+	Chat  func(ctx context.Context, msgs []action.Message, temperature float64) (string, error)
 	// Choose shows the M3 action palette over the given display lines
 	// and returns the picked one; "" means cancelled. nil disables
 	// the "pick" subcommand.
 	Choose func(items []string) (string, error)
-	// Inject sends a key combo (evdev keycodes) via the virtual keyboard;
-	// nil disables M2 auto-capture/auto-paste (v0 hold mode).
-	Inject func(combo ...uint32) error
-	// Served reports whether the last claim was fetched by a reader
-	// (the paste target), waiting up to timeout. nil = assume served.
-	Served func(timeout time.Duration) bool
+	// Inject sends a key combo (evdev keycodes) via the virtual
+	// keyboard; nil disables M2 auto-capture/auto-paste (v0 hold mode).
+	Inject      func(combo ...uint32) error
+	ReadPrimary func() (string, error)
 	// Hold keeps the claim alive and services fetches for the given
 	// duration (the paste-target grace window). nil = no hold.
 	Hold func(d time.Duration)
 	// Owns reports whether our latest clipboard claim is still the
-	// compositor's current one (not superseded by a newer run). nil =
-	// assume still owned.
+	// compositor's current one (not superseded by a newer run).
+	// nil = assume still owned.
 	Owns func() bool
+	// Notify announces a failure the user cannot otherwise see: in
+	// NoPaste mode a failed run leaves the clipboard looking exactly
+	// like a successful one (stale content, no palette), so
+	// post-capture failures must be surfaced. nil = no notify.
+	Notify func(body string)
 	// CopyCombo/PasteCombo override the capture-fallback and delivery
 	// combos. Terminals need e.g. ctrl+shift+v (plain Ctrl+V is not
 	// paste there) and ctrl+shift+c (plain Ctrl+C is SIGINT to the
 	// running program). nil = the defaults below.
 	CopyCombo  []uint32
 	PasteCombo []uint32
+	// NoPaste (--no-paste): delivery claims the result and exits —
+	// no paste keystroke, no clipboard restore. The result is the
+	// user's next manual paste. Suited to targets where injected
+	// keystrokes misbehave (terminals, vim modes). The capture
+	// fallback (copy combo) still applies: it is capture, not
+	// delivery.
+	NoPaste bool
 }
 
 // evdev keycodes for the injection combos.
@@ -70,11 +85,17 @@ var (
 var (
 	pasteServeWindow = 2 * time.Second
 	pasteHoldWindow  = 2500 * time.Millisecond
+	// noPasteHoldWindow: in --no-paste mode the human aims the paste
+	// themselves, so the claim must stay live far longer than the
+	// keystroke grace window. Where a clipboard-history watcher
+	// re-owns the selection the content outlives us anyway; without
+	// one, this window is the whole delivery.
+	noPasteHoldWindow = 10 * time.Second
 )
 
 func usage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "usage: needle-writes <action> | pick | -list")
-	_, _ = fmt.Fprintln(w, "flags: -hold <dur> | --paste <combo> | --copy <combo>  (e.g. ctrl+shift+v)")
+	_, _ = fmt.Fprintln(w, "flags: -hold <dur> | --paste <combo> | --copy <combo> | --no-paste  (e.g. ctrl+shift+v)")
 	_, _ = fmt.Fprint(w, "actions:\n")
 	for _, name := range action.List() {
 		a, _ := action.Get(name)
@@ -163,6 +184,18 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		}
 	}
 
+	// notifyFail surfaces post-capture failures in --no-paste mode:
+	// there, a failed run is otherwise pixel-identical to a
+	// successful one (palette closed, clipboard looks delivered) and
+	// the user could paste stale content believing it is the result
+	// (UX review). Paste-mode failures are observable — the
+	// selection is visibly untouched — so no noise there.
+	notifyFail := func() {
+		if d.NoPaste && d.Notify != nil {
+			d.Notify("rewrite failed — clipboard unchanged")
+		}
+	}
+
 	sel, capErr := d.ReadPrimary()
 	if capErr != nil {
 		_, _ = fmt.Fprintf(stderr, "read primary selection: %v\n", capErr)
@@ -182,6 +215,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if capErr != nil {
 			_, _ = fmt.Fprintf(stderr, "read clipboard: %v\n", capErr)
 			restoreClip(sel) // round-4 finding 1: post-Ctrl+C abort
+			notifyFail()
 			return ExitWayland
 		}
 	}
@@ -198,6 +232,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if cerr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: palette: %v\n", cerr)
 			restoreClip(sel)
+			notifyFail()
 			return ExitWayland
 		}
 		if line == "" {
@@ -208,6 +243,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if perr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", perr)
 			restoreClip(sel)
+			notifyFail()
 			return ExitUsage
 		}
 		act = picked
@@ -217,11 +253,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	if errors.Is(err, action.ErrTooLarge) {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
 		restoreClip(sel)
+		notifyFail()
 		return ExitTooLarge
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
 		restoreClip(sel)
+		notifyFail()
 		return ExitUsage
 	}
 
@@ -229,6 +267,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: engine call failed: %v\n", err)
 		restoreClip(sel)
+		notifyFail()
 		return ExitEngine
 	}
 	res = action.Clean(res)
@@ -236,16 +275,31 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		// Never paste nothing: an empty model result aborts the action.
 		_, _ = fmt.Fprintln(stderr, "needle-writes: engine returned an empty result, aborting")
 		restoreClip(sel)
+		notifyFail()
 		return ExitEngine
 	}
 	if clErr := d.Claim(res); clErr != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard claim failed: %v\n", clErr)
 		restoreClip(sel)
+		notifyFail()
 		return ExitWayland
 	}
 	// The result claim itself clobbers CLIPBOARD: from here the same
 	// restore rule (put savedClip back on any abort) covers delivery.
 	clobbered = true
+	if d.NoPaste {
+		// --no-paste: the result IS the delivery. No keystroke, no
+		// restore — the user pastes it manually (terminal, vim, any
+		// editor where injected keys misbehave or change modes).
+		// Hold the claim briefly so a late fetcher still reaches a
+		// live source; a clipboard-history watcher re-owns the
+		// content after we exit.
+		if d.Hold != nil {
+			d.Hold(noPasteHoldWindow)
+		}
+		_, _ = fmt.Fprint(stdout, res)
+		return ExitOK
+	}
 	if d.Inject != nil {
 		if ierr := d.Inject(pasteCombo...); ierr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: paste-combo injection failed: %v (result stays on the clipboard for manual paste)\n", ierr)

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -30,6 +31,26 @@ const (
 	// paletteWidthChars fits the longest padded item line without
 	// mid-word truncation; pinned to the registry's own budget.
 	paletteWidthChars = action.PaletteLineWidth
+)
+
+// Palette ink fallbacks (UX + design reviews): without a theme file the
+// palette sits on fuzzel's built-in Solarized-light cream, so the
+// fallback inks are Solarized values that clear WCAG AA and keep typed
+// input distinct from the prompt. With a theme file the whole widget is
+// themed from it (one design system, never a mix).
+const (
+	lightTextFallback  = "586e75"
+	lightInputFallback = "073642"
+	// Dark-set defaults, matching the Ryoku M3 ramp shape; used per
+	// key when a theme file exists but lacks that key. Bare hex:
+	// fuzzelColor adds the alpha.
+	darkBackgroundFallback = "1d2024"
+	darkTextFallback       = "c4c6cf"
+	darkPromptFallback     = "e2e2e9"
+	darkInputFallback      = "a9c7ff"
+	darkBorderFallback     = "44474e"
+	darkSelBgFallback      = "264777"
+	darkSelTxFallback      = "d6e3ff"
 )
 
 func main() {
@@ -73,13 +94,18 @@ func parseCombo(s string) ([]uint32, error) {
 	return out, nil
 }
 
-// extractCombos pulls --paste/--copy <combo> flags off the args at any
-// position (terminals need ctrl+shift+v to paste and ctrl+shift+c to
-// copy: plain Ctrl+V is not paste there, and plain Ctrl+C is SIGINT
-// to the running program).
-func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32, err error) {
+// extractCombos pulls --paste/--copy <combo> flags and the --no-paste
+// flag off the args at any position (terminals need ctrl+shift+v to
+// paste and ctrl+shift+c to copy: plain Ctrl+V is not paste there, and
+// plain Ctrl+C is SIGINT to the running program; --no-paste skips the
+// paste keystroke entirely and leaves the result on the clipboard).
+func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32, noPaste bool, err error) {
 	rest = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
+		if args[i] == "--no-paste" {
+			noPaste = true
+			continue
+		}
 		if args[i] != "--paste" && args[i] != "--copy" {
 			rest = append(rest, args[i])
 			continue
@@ -89,11 +115,11 @@ func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32
 			val = args[i+1]
 		}
 		if val == "" {
-			return nil, nil, nil, fmt.Errorf("%s needs a value like ctrl+shift+v", args[i])
+			return nil, nil, nil, false, fmt.Errorf("%s needs a value like ctrl+shift+v", args[i])
 		}
 		codes, cerr := parseCombo(val)
 		if cerr != nil {
-			return nil, nil, nil, cerr
+			return nil, nil, nil, false, cerr
 		}
 		if args[i] == "--paste" {
 			pasteCombo = codes
@@ -102,30 +128,68 @@ func extractCombos(args []string) (rest []string, pasteCombo, copyCombo []uint32
 		}
 		i++
 	}
-	return rest, pasteCombo, copyCombo, nil
+	return rest, pasteCombo, copyCombo, noPaste, nil
 }
 
-// themeSelection reads a matugen-style colors.json (path from the user's
-// config file; "" disables theming) and returns the palette's selection
-// colors. Any failure (missing file, unknown shape) yields empty
-// strings: fuzzel's own defaults, never a crash — the picker must work
-// on any compositor.
-func themeSelection(path string) (bg, text string) {
+// themePalette reads a matugen-style colors.json (path from the user's
+// config file) and returns the palette's full color set: surface,
+// item text, prompt, typed input, border and selection row. Design
+// review: one coherent system per widget — with a theme file the whole
+// palette is themed (dark M3 set); without one (empty path, missing
+// file, corrupt JSON) only the Solarized-light ink fallbacks apply on
+// top of fuzzel's own cream defaults. Never a crash, never a half-
+// themed box: the picker must work on any compositor.
+func themePalette(path string) palette.Options {
 	if path == "" {
-		return "", ""
+		return lightPalette()
 	}
 	// #nosec G304 -- path comes from the user's own config file, the
 	// trust boundary is the config itself.
 	f, err := os.Open(path)
 	if err != nil {
-		return "", ""
+		return lightPalette()
 	}
 	defer func() { _ = f.Close() }()
 	var colors map[string]string
-	if json.NewDecoder(f).Decode(&colors) != nil {
-		return "", ""
+	if derr := json.NewDecoder(f).Decode(&colors); derr != nil {
+		return lightPalette()
 	}
-	return colors["primaryContainer"], colors["onPrimaryContainer"]
+	pick := func(key, fb string) string {
+		if v, ok := colors[key]; ok && v != "" {
+			return themeColor(v)
+		}
+		return fb // dark-set fallbacks are already bare hex
+	}
+	return palette.Options{
+		Background:          pick("surfaceContainer", darkBackgroundFallback),
+		TextColor:           pick("onSurfaceVariant", darkTextFallback),
+		PromptColor:         pick("onSurface", darkPromptFallback),
+		InputColor:          pick("primary", darkInputFallback),
+		BorderColor:         pick("outlineVariant", darkBorderFallback),
+		SelectionBackground: pick("primaryContainer", darkSelBgFallback),
+		SelectionText:       pick("onPrimaryContainer", darkSelTxFallback),
+	}
+}
+
+// themeColor normalizes a matugen colors.json value for fuzzel:
+// matugen emits #aarrggbb (ARGB), fuzzel wants rrggbbaa. Six-digit
+// values pass through (fuzzelColor adds the alpha). Unrecognized
+// shapes are returned as-is and dropped downstream by normalization.
+func themeColor(v string) string {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "#")
+	if len(v) == 8 {
+		return v[2:] + v[:2] // aarrggbb -> rrggbbaa
+	}
+	return v
+}
+
+// lightPalette keeps the AA/anti-fusion inks while leaving surface and
+// selection at fuzzel's built-in Solarized-light defaults.
+func lightPalette() palette.Options {
+	return palette.Options{
+		TextColor:  lightTextFallback,
+		InputColor: lightInputFallback,
+	}
 }
 
 // extractHold pulls a "-hold <duration>" pair off the args at any
@@ -144,8 +208,22 @@ func extractHold(args []string) ([]string, time.Duration) {
 	return args, 0
 }
 
+// palettePrompt decorates the configured base prompt with the delivery
+// mode, so the palette itself tells the user what picking an action
+// will do: replace the selection (auto-paste) or leave the result on
+// the clipboard (--no-paste, paste it yourself). The hint is
+// parenthetical: a bare suffix after the colon reads as a typed filter
+// query (UX review), parentheses read as an annotation.
+func palettePrompt(base string, noPaste bool) string {
+	base = strings.TrimRight(base, " ") // configured prompts carry a trailing space; do not double up
+	if noPaste {
+		return base + " (to clipboard)"
+	}
+	return base + " (replace selection)"
+}
+
 func run(args []string, hold time.Duration) int {
-	args, pasteCombo, copyCombo, cerr := extractCombos(args)
+	args, pasteCombo, copyCombo, noPaste, cerr := extractCombos(args)
 	if cerr != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: %v\n", cerr)
 		return command.ExitUsage
@@ -174,6 +252,13 @@ func run(args []string, hold time.Duration) int {
 			return command.ExitUsage
 		}
 		copyCombo = codes
+	}
+	if noPaste && pasteCombo != nil {
+		// Reviewer nit: migrating a bind to --no-paste leaves a stale
+		// --paste flag or paste_combo config behind; say so instead
+		// of silently ignoring it. Checked after config resolution so
+		// both sources warn.
+		_, _ = fmt.Fprintln(os.Stderr, "needle-writes: --no-paste wins: the paste combo is unused this run")
 	}
 	wl, err := waylandctl.Connect()
 	if err != nil {
@@ -210,17 +295,25 @@ func run(args []string, hold time.Duration) int {
 		Inject:      wl.PressCombo,
 		CopyCombo:   copyCombo,
 		PasteCombo:  pasteCombo,
-		Served:      func(d time.Duration) bool { return wl.WaitClaimServed(d) },
-		Hold:        func(d time.Duration) { wl.PumpFor(d) },
-		Owns:        wl.OwnsClipboard,
+		NoPaste:     noPaste,
+		Notify: func(body string) {
+			// Best-effort desktop notice for invisible failures in
+			// --no-paste mode (UX review). Own timeout: the run ctx
+			// may already be spent. notify-send is a UI helper like
+			// fuzzel, not a Wayland protocol we must speak in-process.
+			nctx, ncancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ncancel()
+			// #nosec G204 -- body is a compile-time constant string
+			_ = exec.CommandContext(nctx, "notify-send", "-a", "needle-writes", "needle-writes", body).Run()
+		},
+		Served: func(d time.Duration) bool { return wl.WaitClaimServed(d) },
+		Hold:   func(d time.Duration) { wl.PumpFor(d) },
+		Owns:   wl.OwnsClipboard,
 		Choose: func(items []string) (string, error) {
-			selBg, selTx := themeSelection(cfg.ThemeFile)
-			return palette.Fuzzel(ctx, palette.Options{
-				Prompt:              cfg.PalettePrompt,
-				WidthChars:          paletteWidthChars,
-				SelectionBackground: selBg,
-				SelectionText:       selTx,
-			}, items)
+			opts := themePalette(cfg.ThemeFile)
+			opts.Prompt = palettePrompt(cfg.PalettePrompt, noPaste)
+			opts.WidthChars = paletteWidthChars
+			return palette.Fuzzel(ctx, opts, items)
 		},
 		Chat: func(ctx context.Context, msgs []action.Message, temperature float64) (string, error) {
 			sm := make([]strata.Message, len(msgs))

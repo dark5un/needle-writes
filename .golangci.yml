@@ -4,6 +4,10 @@ run:
     - live
 linters:
   default: standard
+  exclusions:
+    # Generated protocol bindings carry the canonical "Code generated"
+    # header; their scanner quirks (dead stores) are not our audit surface.
+    generated: strict
   enable:
     - errcheck
     - govet

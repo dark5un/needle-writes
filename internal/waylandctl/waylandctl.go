@@ -22,11 +22,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/SpinningVinyl/go-wayland/wayland/client"
 	ext_data_control "github.com/SpinningVinyl/go-wayland/wayland/staging/ext-data-control-v1"
+	virtual_keyboard "github.com/dark5un/needle-writes/internal/virtualkeyboard"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -72,23 +73,29 @@ type Client struct {
 	dead chan struct{} // closed when the loop goroutine exits
 
 	// State below is touched only on the loop goroutine.
-	globals    map[string]client.RegistryGlobalEvent
-	mimes      map[*ext_data_control.DataControlOffer][]string
-	inFlight   map[*ext_data_control.DataControlOffer]int  // offers mid-transfer: never destroy
-	deferred   map[*ext_data_control.DataControlOffer]bool // destroys parked by inFlight
-	cbOffer    *ext_data_control.DataControlOffer
-	prOffer    *ext_data_control.DataControlOffer
-	cbClaim    string // our own CLIPBOARD claim (compositors do not echo it back)
-	prClaim    string
-	cbClaimSrc *ext_data_control.DataControlSource // source backing cbClaim
-	prClaimSrc *ext_data_control.DataControlSource
-	claimSrcs  []*ext_data_control.DataControlSource // keep claimed sources alive
-	cbSeq      uint32                                // selection-event counter; bumped on every (incl. empty) event
-	prSeq      uint32
-	lastCbRead uint32 // cbSeq at the previous ReadClipboard
-	lastPrRead uint32
-	synced     bool
-	devDone    bool
+	globals      map[string]client.RegistryGlobalEvent
+	mimes        map[*ext_data_control.DataControlOffer][]string
+	inFlight     map[*ext_data_control.DataControlOffer]int  // offers mid-transfer: never destroy
+	deferred     map[*ext_data_control.DataControlOffer]bool // destroys parked by inFlight
+	cbOffer      *ext_data_control.DataControlOffer
+	prOffer      *ext_data_control.DataControlOffer
+	seat         *client.Seat
+	vkMgr        *virtual_keyboard.VirtualKeyboardManager
+	vk           *virtual_keyboard.VirtualKeyboard
+	cbClaimSrc   *ext_data_control.DataControlSource // source backing cbClaim
+	prClaimSrc   *ext_data_control.DataControlSource
+	claimSend    chan struct{} // signaled when the latest claim is fetched
+	cbClaim      string        // our own CLIPBOARD claim (compositors do not echo it back)
+	prClaim      string
+	keymapBytes  []byte                                // XKB keymap copied from the compositor
+	claimSrcs    []*ext_data_control.DataControlSource // keep claimed sources alive
+	cbSeq        uint32                                // selection-event counter; bumped on every (incl. empty) event
+	prSeq        uint32
+	lastCbRead   uint32 // cbSeq at the previous ReadClipboard
+	lastPrRead   uint32
+	keymapFormat uint32
+	synced       bool
+	devDone      bool
 }
 
 // Connect opens the compositor socket. It honours WAYLAND_DISPLAY and, when
@@ -311,6 +318,36 @@ func (c *Client) setup() error {
 			return fmt.Errorf("get data device: %w", err)
 		}
 		c.dev = dev
+		c.seat = seat
+		// Bind a real wl_keyboard purely to CAPTURE the XKB keymap: the
+		// compositor sends keymap to every bound keyboard without focus.
+		// The virtual keyboard must push this keymap before key events.
+		if kb, kerr := seat.GetKeyboard(); kerr == nil {
+			kb.SetKeymapHandler(func(e client.KeyboardKeymapEvent) {
+				// The fd is ours to close once copied (or not copyable).
+				defer func() { _ = closeFD(e.Fd) }()
+				// mmap, not read: the compositor's memfd offset is left at
+				// EOF after writing, so read() returns 0 bytes; mmap is
+				// offset-independent (what wtype/wl-clipboard do).
+				if e.Size == 0 {
+					return
+				}
+				data, merr := unix.Mmap(e.Fd, 0, int(e.Size), unix.PROT_READ, unix.MAP_PRIVATE)
+				if merr != nil {
+					return
+				}
+				c.keymapBytes = append([]byte(nil), data...)
+				c.keymapFormat = e.Format
+				_ = unix.Munmap(data)
+			})
+		}
+		// Virtual keyboard manager is optional (Plan B injection path).
+		if g, gok := c.globals["zwp_virtual_keyboard_manager_v1"]; gok {
+			m := virtual_keyboard.NewVirtualKeyboardManager(c.ctx)
+			if berr := reg.Bind(g.Name, "zwp_virtual_keyboard_manager_v1", min(g.Version, uint32(1)), m); berr == nil {
+				c.vkMgr = m
+			}
+		}
 		dev.SetDataOfferHandler(func(e ext_data_control.DataControlDeviceDataOfferEvent) {
 			e.Id.SetOfferHandler(func(oe ext_data_control.DataControlOfferOfferEvent) {
 				c.mimes[e.Id] = append(c.mimes[e.Id], oe.MimeType)
@@ -577,6 +614,8 @@ func (c *Client) claim(text string, primary bool) error {
 			_ = src.Destroy()
 			return fmt.Errorf("offer plain: %w", oerr)
 		}
+		ch := make(chan struct{}, 1)
+		c.claimSend = ch
 		src.SetSendHandler(func(e ext_data_control.DataControlSourceSendEvent) {
 			// Service the fd OFF the loop: a slow or stalled reader must
 			// never park the loop goroutine (which would wedge Close and
@@ -586,6 +625,12 @@ func (c *Client) claim(text string, primary bool) error {
 				_ = f.SetWriteDeadline(time.Now().Add(writeTimeout))
 				_, _ = io.WriteString(f, text)
 				_ = f.Close()
+				if ch != nil {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
 			}()
 		})
 		src.SetCancelledHandler(func(ext_data_control.DataControlSourceCancelledEvent) {
@@ -646,6 +691,171 @@ func (c *Client) dropSrc(src *ext_data_control.DataControlSource) {
 	}
 }
 
+// HasVirtualKeyboard reports whether the compositor advertised and we
+// bound zwp_virtual_keyboard_manager_v1.
+func (c *Client) HasVirtualKeyboard() bool { return c.vkMgr != nil }
+
+// setupVK creates the virtual keyboard (once) and pushes the captured XKB
+// keymap. Must run on the loop goroutine.
+func (c *Client) setupVK() error {
+	if c.vkMgr == nil {
+		return errors.New("compositor does not support zwp_virtual_keyboard_v1")
+	}
+	if c.vk != nil {
+		return nil
+	}
+	if len(c.keymapBytes) == 0 {
+		return errors.New("no keymap captured from compositor")
+	}
+	if len(c.keymapBytes) > 1<<20 { // XKB keymaps are tens of KB; guard the uint32 conversion
+		return fmt.Errorf("keymap implausibly large: %d bytes", len(c.keymapBytes))
+	}
+	vk, err := c.vkMgr.CreateVirtualKeyboard(c.seat)
+	if err != nil {
+		return fmt.Errorf("create virtual keyboard: %w", err)
+	}
+	fd, merr := unix.MemfdCreate("needle-xkb-keymap", 0)
+	if merr != nil {
+		_ = vk.Destroy()
+		return fmt.Errorf("memfd keymap: %w", merr)
+	}
+	if _, werr := unix.Write(fd, c.keymapBytes); werr != nil {
+		_ = closeFD(fd)
+		_ = vk.Destroy()
+		return fmt.Errorf("write keymap: %w", werr)
+	}
+	if kerr := vk.Keymap(c.keymapFormat, fd, uint32(len(c.keymapBytes))); kerr != nil { //nolint:gosec // len bounded to 1MiB above
+		_ = closeFD(fd)
+		_ = vk.Destroy()
+		return fmt.Errorf("keymap: %w", kerr)
+	}
+	_ = closeFD(fd) // compositor holds its own reference after the request
+	c.vk = vk
+	return nil
+}
+
+// SetupVirtualKeyboard prepares key injection: creates the virtual
+// keyboard, pushes the keymap, and round-trips so the compositor has
+// processed both. Sends NO keystrokes.
+func (c *Client) SetupVirtualKeyboard() error {
+	return c.do(func() error {
+		if err := c.setupVK(); err != nil {
+			return err
+		}
+		return c.roundtrip()
+	})
+}
+
+// CloseVirtualKeyboard destroys the virtual keyboard if created.
+func (c *Client) CloseVirtualKeyboard() {
+	_ = c.do(func() error {
+		if c.vk != nil {
+			_ = c.vk.Destroy()
+			c.vk = nil
+		}
+		return nil
+	})
+}
+
+// PressCombo presses the given evdev keycodes in order and releases them
+// in reverse (e.g. 29,47 = Ctrl+V), maintaining the XKB modifier mask,
+// then round-trips so the events are flushed before the caller proceeds.
+// WARNING: keystrokes land in the FOCUSED window.
+func (c *Client) PressCombo(keycodes ...uint32) error {
+	return c.do(func() error {
+		if err := c.setupVK(); err != nil {
+			return err
+		}
+		var mods uint32
+		pressed := make([]uint32, 0, len(keycodes))
+		release := func() error { // best-effort: never leave keys logically down
+			var rerr error
+			for i := len(pressed) - 1; i >= 0; i-- {
+				k := pressed[i]
+				if err := c.vk.Key(0, k, 0); err != nil {
+					rerr = errors.Join(rerr, fmt.Errorf("key release %d: %w", k, err))
+				}
+				mods &^= modMask(k)
+				if err := c.vk.Modifiers(mods, 0, 0, 0); err != nil {
+					rerr = errors.Join(rerr, fmt.Errorf("modifiers: %w", err))
+				}
+			}
+			pressed = pressed[:0]
+			return rerr
+		}
+		var err error
+		for _, k := range keycodes {
+			pressed = append(pressed, k)
+			if err = c.vk.Key(0, k, 1); err != nil {
+				err = fmt.Errorf("key press %d: %w", k, err)
+				break
+			}
+			mods |= modMask(k)
+			if err = c.vk.Modifiers(mods, 0, 0, 0); err != nil {
+				err = fmt.Errorf("modifiers: %w", err)
+				break
+			}
+		}
+		if rerr := release(); err == nil {
+			err = rerr
+		}
+		if err != nil {
+			return err
+		}
+		return c.roundtrip()
+	})
+}
+
+// modMask maps evdev keycodes to the XKB modifier mask bits used by the
+// Modifiers request (shift=1, caps=2, ctrl=4, alt=8, super=64). Keycodes
+// verified against linux/input-event-codes.h: 42/54 shift, 58 capslock,
+// 29/97 ctrl, 56/100 alt, 125/126 meta(super).
+func modMask(key uint32) uint32 {
+	switch key {
+	case 42, 54:
+		return 1
+	case 58:
+		return 2
+	case 29, 97:
+		return 4
+	case 56, 100:
+		return 8
+	case 125, 126:
+		return 64
+	}
+	return 0
+}
+
+// WaitClaimServed blocks (pumping events) until the most recent claim has
+// been fetched by a reader — i.e. the paste target took the result — or
+// the timeout expires. Returns true when served.
+func (c *Client) WaitClaimServed(timeout time.Duration) bool {
+	served := false
+	_ = c.do(func() error {
+		ch := c.claimSend
+		if ch == nil {
+			return nil
+		}
+		deadline := time.NewTimer(timeout)
+		defer deadline.Stop()
+		for {
+			select {
+			case <-ch:
+				served = true
+				return nil
+			case ev, ok := <-c.evc:
+				if !ok {
+					return ErrDead
+				}
+				c.dispatch(ev)
+			case <-deadline.C:
+				return nil
+			}
+		}
+	})
+	return served
+}
+
 // Close tears down the connection. Any clipboard claims die with it.
 func (c *Client) Close() {
 	// Close on the loop goroutine so it cannot race DispatchMessage.
@@ -658,4 +868,4 @@ func (c *Client) Close() {
 	}
 }
 
-func closeFD(fd int) error { return syscall.Close(fd) }
+func closeFD(fd int) error { return unix.Close(fd) }

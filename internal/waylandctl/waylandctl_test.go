@@ -272,6 +272,51 @@ func TestPickTextMime(t *testing.T) {
 	}
 }
 
+// --- M2: virtual-keyboard injection ---
+
+func TestKeymapCaptured(t *testing.T) {
+	// Connecting must capture the compositor's XKB keymap (bound
+	// wl_keyboard receives keymap unconditionally). The virtual keyboard
+	// requires it before any key event.
+	c := requireCompositor(t)
+	if len(c.keymapBytes) == 0 {
+		t.Fatal("no keymap captured from compositor")
+	}
+	if c.keymapFormat != 1 { // WL_KEYMAP_FORMAT_XKB_V1
+		t.Fatalf("keymap format = %d, want 1", c.keymapFormat)
+	}
+}
+
+func TestVirtualKeyboardSetupRoundTrip(t *testing.T) {
+	// Create the virtual keyboard and push the keymap; the connection
+	// must survive the round-trip (Hyprland kills clients on protocol
+	// misuse). NO key events: the user may be AFK; keystrokes would land
+	// in whatever window has focus.
+	c := requireCompositor(t)
+	if !c.HasVirtualKeyboard() {
+		t.Skip("compositor lacks zwp_virtual_keyboard_manager_v1")
+	}
+	if err := c.SetupVirtualKeyboard(); err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseVirtualKeyboard()
+	if err := c.do(func() error { return c.roundtrip() }); err != nil {
+		t.Fatalf("connection dead after vk setup: %v", err)
+	}
+}
+
+func TestPressCombo(t *testing.T) {
+	// Real key injection is opt-in: it types into the FOCUSED window.
+	// Live verification happens via the Hyprland keybind, not CI.
+	if os.Getenv("NEEDLE_ALLOW_KEY_INJECTION") != "1" {
+		t.Skip("set NEEDLE_ALLOW_KEY_INJECTION=1 to inject real keystrokes")
+	}
+	c := requireCompositor(t)
+	if err := c.PressCombo(29, 47); err != nil { // Ctrl+V
+		t.Fatal(err)
+	}
+}
+
 func TestSocketPathProbe(t *testing.T) {
 	dir := t.TempDir()
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(dir, "wayland-1"), Net: "unix"})

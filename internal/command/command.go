@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/dark5un/needle-writes/internal/action"
 )
@@ -29,7 +30,19 @@ type Deps struct {
 	ReadClip    func() (string, error)
 	Claim       func(string) error
 	Chat        func(ctx context.Context, msgs []action.Message, temperature float64) (string, error)
+	// Inject sends a key combo (evdev keycodes) via the virtual keyboard;
+	// nil disables M2 auto-capture/auto-paste (v0 hold mode).
+	Inject func(combo ...uint32) error
+	// Served reports whether the last claim was fetched by a reader
+	// (the paste target), waiting up to timeout. nil = assume served.
+	Served func(timeout time.Duration) bool
 }
+
+// evdev keycodes for the injection combos.
+var (
+	CtrlC = []uint32{29, 46}
+	CtrlV = []uint32{29, 47}
+)
 
 func usage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "usage: needle-writes <action> | -list")
@@ -61,14 +74,28 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		return ExitUsage
 	}
 
+	// Save the user's clipboard BEFORE anything can clobber it (the
+	// Ctrl+C capture fallback overwrites CLIPBOARD), so the delivery
+	// restore puts back the ORIGINAL content. Best-effort: a read error
+	// just means there is nothing to restore.
+	var savedClip string
+	if d.Inject != nil {
+		savedClip, _ = d.ReadClip()
+	}
+
 	sel, capErr := d.ReadPrimary()
 	if capErr != nil {
 		_, _ = fmt.Fprintf(stderr, "read primary selection: %v\n", capErr)
 		return ExitWayland
 	}
+	if sel == "" && d.Inject != nil {
+		// M2: no PRIMARY — ask the focused app for a copy, then read
+		// the clipboard (which now carries the selection).
+		if ierr := d.Inject(CtrlC...); ierr != nil {
+			_, _ = fmt.Fprintf(stderr, "needle-writes: Ctrl+C injection failed: %v (falling back to current clipboard)\n", ierr)
+		}
+	}
 	if sel == "" {
-		// No PRIMARY (nothing highlighted): fall back to CLIPBOARD, which
-		// the user may have filled with Ctrl+C just before the hotkey.
 		sel, capErr = d.ReadClip()
 		if capErr != nil {
 			_, _ = fmt.Fprintf(stderr, "read clipboard: %v\n", capErr)
@@ -101,9 +128,25 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		_, _ = fmt.Fprintln(stderr, "needle-writes: engine returned an empty result, aborting")
 		return ExitEngine
 	}
-	if cerr := d.Claim(res); cerr != nil {
-		_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard claim failed: %v\n", cerr)
+	if clErr := d.Claim(res); clErr != nil {
+		_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard claim failed: %v\n", clErr)
 		return ExitWayland
+	}
+	if d.Inject != nil {
+		if ierr := d.Inject(CtrlV...); ierr != nil {
+			_, _ = fmt.Fprintf(stderr, "needle-writes: Ctrl+V injection failed: %v (result stays on the clipboard for manual paste)\n", ierr)
+		} else {
+			if d.Served != nil && !d.Served(2*time.Second) {
+				_, _ = fmt.Fprintln(stderr, "needle-writes: paste target did not fetch the result within 2s")
+			}
+			// The paste has been served (or the target declined it): put
+			// the user's original clipboard back.
+			if savedClip != "" {
+				if rerr := d.Claim(savedClip); rerr != nil {
+					_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard restore failed: %v\n", rerr)
+				}
+			}
+		}
 	}
 	_, _ = fmt.Fprint(stdout, res)
 	return ExitOK

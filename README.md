@@ -47,10 +47,23 @@ needle-writes translate-en
 needle-writes translate-el
 ```
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Result claimed (and pasted via Ctrl+V when injection is available) |
+| 1 | Engine call failed or returned an empty result (nothing pasted) |
+| 2 | Nothing selected — select or copy text first (nothing pasted) |
+| 3 | Selection larger than the model budget |
+| 4 | Wayland/compositor failure (selection, claim, or injection) |
+| 64 | Usage error |
+
 ## Status
 
-M0 (pure-Go selection read/claim) and M1 (Strata round-trip) in progress.
-Roadmap: `~/Documents/plans/writing-tools-plan.md`.
+M0 (pure-Go selection read/claim), M1 (Strata round-trip) and M2
+(virtual-keyboard Ctrl+C capture fallback + Ctrl+V delivery with
+clipboard restore) are implemented. Roadmap:
+`~/Documents/plans/writing-tools-plan.md`.
 
 ## Development
 

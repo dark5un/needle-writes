@@ -80,6 +80,8 @@ func run(args []string, hold time.Duration) int {
 		ReadPrimary: wl.ReadPrimary,
 		ReadClip:    wl.ReadClipboard,
 		Claim:       wl.ClaimClipboard,
+		Inject:      wl.PressCombo,
+		Served:      func(d time.Duration) bool { return wl.WaitClaimServed(d) },
 		Chat: func(ctx context.Context, msgs []action.Message, temperature float64) (string, error) {
 			sm := make([]strata.Message, len(msgs))
 			for i, m := range msgs {
@@ -88,7 +90,9 @@ func run(args []string, hold time.Duration) int {
 			return client.Chat(ctx, sm, temperature)
 		},
 	}
-	code := command.Run(context.Background(), args, os.Stdout, os.Stderr, deps)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second) // one explicit budget for the whole one-shot
+	defer cancel()
+	code := command.Run(ctx, args, os.Stdout, os.Stderr, deps)
 	if code == command.ExitOK && hold > 0 {
 		// Stay alive serving the claim so a manual Ctrl+V can land it.
 		time.Sleep(hold)

@@ -1,0 +1,4 @@
+/needle-writes
+/bin/
+*.test
+coverage.out

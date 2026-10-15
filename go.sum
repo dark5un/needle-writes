@@ -1,0 +1,4 @@
+github.com/SpinningVinyl/go-wayland v0.0.0-20260926104109-3e82ca3737e3 h1:D3N6CBTtZYyRSSL/GhvDrFyMPpCheALGXrFCk+kaS0w=
+github.com/SpinningVinyl/go-wayland v0.0.0-20260926104109-3e82ca3737e3/go.mod h1:RZi1r17nvVFh6dPfW8zgx4T4DdPFgu130SSjKGhABxE=
+github.com/SpinningVinyl/go-wayland/wayland v0.0.0-20260926104109-3e82ca3737e3 h1:vl1TfIUspLDYoUmhGdoB2npT0xuvaeFxBRby3X1IiSY=
+github.com/SpinningVinyl/go-wayland/wayland v0.0.0-20260926104109-3e82ca3737e3/go.mod h1:VxNjRN4/A/ZW6BF/oOkoM5veZjcuhcdRhYZdMN1z5hs=

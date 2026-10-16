@@ -51,10 +51,11 @@ type Deps struct {
 	// compositor's current one (not superseded by a newer run).
 	// nil = assume still owned.
 	Owns func() bool
-	// Notify announces a failure the user cannot otherwise see: in
-	// NoPaste mode a failed run leaves the clipboard looking exactly
-	// like a successful one (stale content, no palette), so
-	// post-capture failures must be surfaced. nil = no notify.
+	// Notify is the desktop-notice seam for NoPaste mode, where runs
+	// have no visible end-state: it announces completion (action +
+	// elapsed, so silence means still working) and post-capture
+	// failures (so a stale clipboard is never mistaken for a
+	// result). nil = no notices.
 	Notify func(body string)
 	// CopyCombo/PasteCombo override the capture-fallback and delivery
 	// combos. Terminals need e.g. ctrl+shift+v (plain Ctrl+V is not
@@ -192,7 +193,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	// selection is visibly untouched — so no noise there.
 	notifyFail := func() {
 		if d.NoPaste && d.Notify != nil {
-			d.Notify("rewrite failed — clipboard unchanged")
+			// Symmetry with the completion notice: name the action
+			// once the palette has resolved one.
+			what := act.Name
+			if what == "" {
+				what = "rewrite"
+			}
+			d.Notify(what + " failed — clipboard unchanged")
 		}
 	}
 
@@ -263,7 +270,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		return ExitUsage
 	}
 
+	t0 := time.Now()
 	res, err := d.Chat(ctx, msgs, act.Temperature)
+	engineElapsed := time.Since(t0)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: engine call failed: %v\n", err)
 		restoreClip(sel)
@@ -291,6 +300,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		// --no-paste: the result IS the delivery. No keystroke, no
 		// restore — the user pastes it manually (terminal, vim, any
 		// editor where injected keys misbehave or change modes).
+		// Completion notice: in this mode there is no visible
+		// end-state, so silence would be ambiguous between "still
+		// working" and "done" (and with a slow engine, dangerous:
+		// a stale clipboard pasted believing it is the result).
+		// No notice yet = still running; notice = delivered.
+		if d.Notify != nil {
+			d.Notify(fmt.Sprintf("%s → clipboard in %s", act.Name, engineElapsed.Round(100*time.Millisecond)))
+		}
 		// Hold the claim briefly so a late fetcher still reaches a
 		// live source; a clipboard-history watcher re-owns the
 		// content after we exit.

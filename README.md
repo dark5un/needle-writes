@@ -159,7 +159,10 @@ The robust mode for terminals and modal editors (vim changes mode on
 injected keystrokes) is **`--no-paste`**: the result is claimed as
 CLIPBOARD and left there — no keystrokes are injected at all, nothing
 is auto-pasted, and the clipboard is NOT restored (the result is the
-point). Paste it yourself where you want it:
+point). A desktop notice closes the loop: `proofread → clipboard in
+1.9s` on success, `rewrite failed — clipboard unchanged` on failure —
+so silence means the engine is still working. Paste it yourself where
+you want it:
 
 ```lua
 -- Lua config (e.g. Ryoku's user.lua)

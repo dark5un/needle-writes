@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -190,15 +191,25 @@ func TestNoPasteEngineFailureStillRestores(t *testing.T) {
 	}
 }
 
-func TestNoPasteSuccessDoesNotNotify(t *testing.T) {
+func TestNoPasteSuccessNotifiesWithActionAndElapsed(t *testing.T) {
+	// The completion half of the clipboard-mode feedback contract:
+	// no notification = still working, notification = done (and it
+	// names the action so a slow engine is unambiguous).
 	d := &deps{primary: "x", clipboard: "user clip", chatOut: "RESULT"}
 	d.noPaste = true
 	code, _, _ := run(t, d, "proofread")
 	if code != ExitOK {
 		t.Fatalf("exit=%d", code)
 	}
-	if len(d.notifyMsgs) != 0 {
-		t.Fatalf("notifyMsgs = %v, want none on success", d.notifyMsgs)
+	if len(d.notifyMsgs) != 1 {
+		t.Fatalf("notifyMsgs = %v, want exactly one completion notice", d.notifyMsgs)
+	}
+	msg := strings.ToLower(d.notifyMsgs[0])
+	if !strings.Contains(msg, "proofread") || !strings.Contains(msg, "clipboard") {
+		t.Fatalf("completion notice %q must name the action and the destination", d.notifyMsgs[0])
+	}
+	if !regexp.MustCompile(` in \d+(\.\d+)?s`).MatchString(msg) {
+		t.Fatalf("completion notice %q must carry the elapsed time", d.notifyMsgs[0])
 	}
 }
 

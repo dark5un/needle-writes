@@ -270,6 +270,9 @@ func buildEngine(cfg config.Config) *strata.Engine {
 	engine.OnFallback = func(url string) {
 		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: WARNING: selection sent to fallback endpoint %s — text leaves this machine\n", url)
 	}
+	engine.OnBudgetRetry = func(url string, hit int) {
+		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: engine hit the token budget (%d); retrying doubled\n", hit)
+	}
 	if cfg.FallbackEndpoint == "" && os.Getenv(fbURLEnvVar) == "" {
 		return engine // local-only shipped default
 	}

@@ -24,6 +24,9 @@ func TestBuildEnginePrimary(t *testing.T) {
 	if e.Primary.MaxTokens != cfg.MaxTokens || e.Primary.HTTP.Timeout != cfg.Timeout {
 		t.Fatalf("engine budget not applied: max_tokens=%d timeout=%v", e.Primary.MaxTokens, e.Primary.HTTP.Timeout)
 	}
+	if e.Clean == nil || e.OnFallback == nil || e.OnBudgetRetry == nil {
+		t.Fatal("engine must wire the cleaner and both announce hooks at construction")
+	}
 	// Env beats config (the repo's documented precedence).
 	t.Setenv(urlEnvVar, "http://envhost:9/v1")
 	t.Setenv(modelEnvVar, "env-model")

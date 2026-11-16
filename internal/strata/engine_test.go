@@ -178,6 +178,40 @@ func TestEngineLengthRetryCappedAtFourTimes(t *testing.T) {
 	}
 }
 
+func TestEngineAnnouncesBudgetRetry(t *testing.T) {
+	// mac parity: complete() logs "engine hit the token budget (N);
+	// retrying doubled" before each doubling retry. The Go engine must
+	// surface the same event through the hook — silent truncation
+	// retries are an observability gap.
+	var notes []string
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if hits == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"cut"},"finish_reason":"length"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"full"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	e := &Engine{
+		Primary: &Client{BaseURL: srv.URL + "/v1", Model: "p", HTTP: srv.Client(), MaxTokens: 100},
+		OnBudgetRetry: func(endpoint string, nextBudget int) {
+			notes = append(notes, fmt.Sprintf("%s:%d", endpoint, nextBudget))
+		},
+	}
+	text, _, err := e.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "full" {
+		t.Fatalf("text = %q", text)
+	}
+	if len(notes) != 1 || notes[0] != e.Primary.BaseURL+":100" {
+		t.Fatalf("budget-retry notes = %v, want one announce of the hit budget", notes)
+	}
+}
+
 func TestEngineCleanedEmptyResultTriggersFallback(t *testing.T) {
 	// Emptiness is judged AFTER the output cleaner (mac checks
 	// Cleaner.clean(content)): a primary reply that cleans to nothing

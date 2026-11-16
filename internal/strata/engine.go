@@ -44,6 +44,10 @@ type Engine struct {
 	// (the selection is about to leave the machine) — never after, so
 	// even a failed fallback is announced. nil = no announce.
 	OnFallback func(endpointURL string)
+	// OnBudgetRetry is called before each doubled-budget retry, with
+	// the endpoint and the budget that was hit (mac logs the same
+	// event: "engine hit the token budget (N); retrying doubled").
+	OnBudgetRetry func(endpointURL string, hitBudget int)
 }
 
 func (e *Engine) clean(s string) string {
@@ -64,6 +68,9 @@ func (e *Engine) attempt(ctx context.Context, c *Client, msgs []Message, tempera
 			return "", err
 		}
 		if reason == "length" && budget > 0 && budget < c.MaxTokens*lengthRetryFactor {
+			if e.OnBudgetRetry != nil {
+				e.OnBudgetRetry(c.BaseURL, budget) // the budget that was hit (mac wording)
+			}
 			budget *= 2
 			continue
 		}

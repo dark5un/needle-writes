@@ -45,6 +45,10 @@ resident, and the whole tree is readable Go behind `go vet` +
   via a single Ctrl+V combo (virtual keyboard); the user's clipboard is
   restored afterwards — also on cancel. Never pastes on an empty capture,
   never restores over a newer run's claim.
+- **Budget-aware.** With `max_tokens` set, a `finish_reason: length`
+  answer (thinking models spending the budget on reasoning) retries the
+  same endpoint at doubled budget, up to 4x the configured value —
+  before the fallback (if configured) is ever consulted.
 
 ## Install
 

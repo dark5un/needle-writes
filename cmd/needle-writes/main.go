@@ -263,6 +263,13 @@ func buildEngine(cfg config.Config) *strata.Engine {
 	)
 	applyBudget(primary, cfg)
 	engine := &strata.Engine{Primary: primary}
+	// Clean before emptiness is judged, and announce the fallback the
+	// moment it is about to be used — the mac contract (review pass:
+	// a failed fallback attempt still sent the text).
+	engine.Clean = action.Clean
+	engine.OnFallback = func(url string) {
+		_, _ = fmt.Fprintf(os.Stderr, "needle-writes: WARNING: selection sent to fallback endpoint %s — text leaves this machine\n", url)
+	}
 	if cfg.FallbackEndpoint == "" && os.Getenv(fbURLEnvVar) == "" {
 		return engine // local-only shipped default
 	}
@@ -272,7 +279,10 @@ func buildEngine(cfg config.Config) *strata.Engine {
 		envOr(fbModelEnvVar, cfg.FallbackModel),
 	)
 	if fb.Model == "" {
-		fb.Model = primary.Model // inherit unless pinned
+		// Deliberate divergence from mac (which pins a literal
+		// "needle"): inheriting the primary's model name is the
+		// least-surprising default across a heterogeneous fleet.
+		fb.Model = primary.Model
 	}
 	applyBudget(fb, cfg)
 	engine.Fallback = fb
@@ -332,9 +342,11 @@ func run(args []string, hold time.Duration) int {
 
 	engine := buildEngine(cfg)
 
-	// One explicit budget for the whole one-shot: the per-request
-	// engine deadline plus headroom for capture and delivery.
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+30*time.Second)
+	// One explicit budget for the whole one-shot: a full per-request
+	// engine deadline for the primary AND the fallback (they run
+	// sequentially; the client's own timeout bounds each attempt)
+	// plus headroom for capture and delivery.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*cfg.Timeout+30*time.Second)
 	defer cancel()
 
 	deps := command.Deps{
@@ -369,12 +381,9 @@ func run(args []string, hold time.Duration) int {
 			for i, m := range msgs {
 				sm[i] = strata.Message{Role: m.Role, Content: m.Content}
 			}
-			text, source, eerr := engine.Chat(ctx, sm, temperature)
-			if eerr == nil && source == strata.SourceFallback {
-				// Privacy-critical deviation from the all-local
-				// default: announce every use, mac-style.
-				_, _ = fmt.Fprintf(os.Stderr, "needle-writes: WARNING: selection sent to fallback endpoint %s — text leaves this machine\n", engine.Fallback.BaseURL)
-			}
+			// engine.OnFallback already announced any fallback use
+			// before the request left (mac contract).
+			text, _, eerr := engine.Chat(ctx, sm, temperature)
 			return text, eerr
 		},
 	}

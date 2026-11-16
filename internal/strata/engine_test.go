@@ -2,6 +2,8 @@ package strata
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -83,6 +85,131 @@ func TestEngineFallsBackOnEmptyResult(t *testing.T) {
 	}
 	if source != "fallback" || text != "from-fallback" {
 		t.Fatalf("empty primary result must trigger fallback: got %q/%q", text, source)
+	}
+}
+
+func TestEngineAnnouncesFallbackBeforeUse(t *testing.T) {
+	// Privacy contract (mac parity): the announce hook fires when the
+	// fallback is DISPATCHED, not when it succeeds — the text has left
+	// the machine even if both endpoints fail. And it fires exactly once.
+	var announced []string
+	var fbHits int
+	pSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	t.Cleanup(pSrv.Close)
+	fbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fbHits++
+		if len(announced) == 0 {
+			t.Error("OnFallback must fire BEFORE the fallback request is served")
+		}
+		http.Error(w, "nope", http.StatusForbidden)
+	}))
+	t.Cleanup(fbSrv.Close)
+
+	e := &Engine{
+		Primary:    &Client{BaseURL: pSrv.URL + "/v1", Model: "p", HTTP: pSrv.Client()},
+		Fallback:   &Client{BaseURL: fbSrv.URL + "/v1", Model: "f", HTTP: fbSrv.Client()},
+		OnFallback: func(url string) { announced = append(announced, url) },
+	}
+	_, _, err := e.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2)
+	if err == nil {
+		t.Fatal("want combined error when both fail")
+	}
+	if len(announced) != 1 || announced[0] != e.Fallback.BaseURL {
+		t.Fatalf("announce = %v, want exactly one with the fallback URL", announced)
+	}
+	if fbHits != 1 {
+		t.Fatalf("fallback hits = %d, want 1", fbHits)
+	}
+}
+
+func TestEngineRetriesLengthFinishDoubledBudget(t *testing.T) {
+	// Thinking models spend the budget on reasoning: a "length" finish
+	// means the visible answer was cut off. Same endpoint, doubled
+	// max_tokens, capped at 4x the configured budget (mac contract).
+	var gotBudgets []float64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotBudgets = append(gotBudgets, body["max_tokens"].(float64))
+		if len(gotBudgets) < 2 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"cut off"},"finish_reason":"length"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"full answer"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	e := &Engine{Primary: &Client{BaseURL: srv.URL + "/v1", Model: "p", HTTP: srv.Client(), MaxTokens: 100}}
+	text, source, err := e.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "full answer" || source != "primary" {
+		t.Fatalf("got %q/%q", text, source)
+	}
+	if len(gotBudgets) != 2 || gotBudgets[0] != 100 || gotBudgets[1] != 200 {
+		t.Fatalf("budget sequence = %v, want [100 200]", gotBudgets)
+	}
+}
+
+func TestEngineLengthRetryCappedAtFourTimes(t *testing.T) {
+	// The cap is a request count guard: 100 -> 200 -> 400, then the
+	// last (truncated but non-empty) answer is delivered — exactly the
+	// mac fallthrough, not an error.
+	var gotBudgets []float64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotBudgets = append(gotBudgets, body["max_tokens"].(float64))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"truncated at ` + fmt.Sprintf("%d", len(gotBudgets)) + `"},"finish_reason":"length"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	e := &Engine{Primary: &Client{BaseURL: srv.URL + "/v1", Model: "p", HTTP: srv.Client(), MaxTokens: 100}}
+	text, _, err := e.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "truncated at 3" {
+		t.Fatalf("text = %q, want the capped last attempt", text)
+	}
+	if len(gotBudgets) != 3 || gotBudgets[2] != 400 {
+		t.Fatalf("budget sequence = %v, want [100 200 400]", gotBudgets)
+	}
+}
+
+func TestEngineCleanedEmptyResultTriggersFallback(t *testing.T) {
+	// Emptiness is judged AFTER the output cleaner (mac checks
+	// Cleaner.clean(content)): a primary reply that cleans to nothing
+	// is a failure, not a delivery of blank text.
+	var announced int
+	pSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"chatter"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(pSrv.Close)
+	fbSrv := okServer("from-fallback")
+	t.Cleanup(fbSrv.Close)
+
+	e := &Engine{
+		Primary:  &Client{BaseURL: pSrv.URL + "/v1", Model: "p", HTTP: pSrv.Client()},
+		Fallback: &Client{BaseURL: fbSrv.URL + "/v1", Model: "f", HTTP: fbSrv.Client()},
+		Clean: func(s string) string {
+			if s == "chatter" {
+				return ""
+			}
+			return s
+		},
+		OnFallback: func(string) { announced++ },
+	}
+	text, source, err := e.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != "fallback" || text != "from-fallback" {
+		t.Fatalf("got %q/%q, want from-fallback/fallback", text, source)
+	}
+	if announced != 1 {
+		t.Fatalf("announced = %d, want 1", announced)
 	}
 }
 

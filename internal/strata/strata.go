@@ -60,20 +60,30 @@ type chatRequest struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 }
 
-// Chat sends the messages and returns the first choice's content.
+// Chat sends the messages and returns the first choice's content, using
+// the client's configured token budget.
 func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) (string, error) {
+	content, _, err := c.chatAttempt(ctx, msgs, temperature, c.MaxTokens)
+	return content, err
+}
+
+// chatAttempt is one completion request with an explicit token budget
+// (0 = omit max_tokens). It also reports the finish_reason, which the
+// Engine needs to spot budget-truncated answers.
+func (c *Client) chatAttempt(ctx context.Context, msgs []Message, temperature float64, maxTokens int) (content, finishReason string, err error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       c.Model,
 		Messages:    msgs,
 		Temperature: temperature,
-		MaxTokens:   c.MaxTokens,
+		MaxTokens:   maxTokens,
 	})
 	if err != nil {
-		return "", fmt.Errorf("strata: marshal: %w", err)
+		return "", "", fmt.Errorf("strata: marshal: %w", err)
 	}
 
 	url := strings.TrimRight(c.BaseURL, "/") + "/chat/completions"
@@ -81,7 +91,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) 
 	// (a local engine URL by design); there is no untrusted input here.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("strata: request: %w", err)
+		return "", "", fmt.Errorf("strata: request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
@@ -89,29 +99,29 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) 
 	// #nosec G704 -- same operator-configured endpoint as above.
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("strata: %w", err)
+		return "", "", fmt.Errorf("strata: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("strata: read: %w", err)
+		return "", "", fmt.Errorf("strata: read: %w", err)
 	}
 	if int64(len(data)) > maxResponseBytes {
-		return "", fmt.Errorf("strata: response larger than %d bytes", maxResponseBytes)
+		return "", "", fmt.Errorf("strata: response larger than %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("strata: HTTP %d: %s", resp.StatusCode, snippet(data))
+		return "", "", fmt.Errorf("strata: HTTP %d: %s", resp.StatusCode, snippet(data))
 	}
 
 	var cr chatResponse
 	if uerr := json.Unmarshal(data, &cr); uerr != nil {
-		return "", fmt.Errorf("strata: bad json: %w", uerr)
+		return "", "", fmt.Errorf("strata: bad json: %w", uerr)
 	}
 	if len(cr.Choices) == 0 {
-		return "", ErrEmptyChoices
+		return "", "", ErrEmptyChoices
 	}
-	return cr.Choices[0].Message.Content, nil
+	return cr.Choices[0].Message.Content, cr.Choices[0].FinishReason, nil
 }
 
 // snippet truncates an error body so responses never end up in full in logs.

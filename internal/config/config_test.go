@@ -213,6 +213,12 @@ func TestEngineBudgetGarbageFails(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("zero timeout must error")
 	}
+	// Upper bound: an absurd timeout overflows time.Duration and would
+	// silently go negative — reject it instead.
+	writeCfg(t, "timeout = 99999999999\n")
+	if _, err := Load(); err == nil {
+		t.Fatal("absurd timeout must error, not overflow")
+	}
 }
 
 func TestFallbackDisabledByDefault(t *testing.T) {

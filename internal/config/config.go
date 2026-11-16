@@ -118,6 +118,11 @@ func setTimeout(c *Config, v string) error {
 	if n <= 0 {
 		return fmt.Errorf("timeout: must be a positive number of seconds, got %d", n)
 	}
+	if n > 86400 {
+		// Guard the time.Duration multiplication: absurd values
+		// overflow toward negative and would kill every request.
+		return fmt.Errorf("timeout: %d seconds exceeds the 86400 s (24 h) limit", n)
+	}
 	c.Timeout = time.Duration(n) * time.Second
 	return nil
 }

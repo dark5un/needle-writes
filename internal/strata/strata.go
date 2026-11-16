@@ -25,10 +25,11 @@ type Message struct {
 
 // Client talks to a /v1/chat/completions endpoint.
 type Client struct {
-	HTTP    *http.Client
-	BaseURL string // e.g. http://127.0.0.1:11434/v1
-	APIKey  string
-	Model   string
+	HTTP      *http.Client
+	BaseURL   string // e.g. http://127.0.0.1:11434/v1
+	APIKey    string
+	Model     string
+	MaxTokens int // generated-token budget; 0 = omit from the request
 }
 
 // New returns a client with a sane default timeout.
@@ -54,6 +55,7 @@ type chatRequest struct {
 	Messages    []Message `json:"messages"`
 	Temperature float64   `json:"temperature"`
 	Stream      bool      `json:"stream"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
 }
 
 type chatResponse struct {
@@ -68,6 +70,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, temperature float64) 
 		Model:       c.Model,
 		Messages:    msgs,
 		Temperature: temperature,
+		MaxTokens:   c.MaxTokens,
 	})
 	if err != nil {
 		return "", fmt.Errorf("strata: marshal: %w", err)

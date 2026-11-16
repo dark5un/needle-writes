@@ -107,6 +107,48 @@ func TestChatRespectsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestChatSendsMaxTokensWhenSet(t *testing.T) {
+	var gotBody map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &gotBody); err != nil {
+			t.Errorf("bad json from client: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"x"}}]}`))
+	})
+	c.MaxTokens = 4096
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if gotBody["max_tokens"] != float64(4096) {
+		t.Fatalf("max_tokens = %v, want 4096", gotBody["max_tokens"])
+	}
+}
+
+func TestChatOmitsMaxTokensWhenUnset(t *testing.T) {
+	// Zero means "no opinion": the request must not carry the key at
+	// all, so engines pick their own context budget (v0 behaviour).
+	var gotBody map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"x"}}]}`))
+	})
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gotBody["max_tokens"]; ok {
+		t.Fatalf("max_tokens must be absent when unset: %v", gotBody["max_tokens"])
+	}
+}
+
+func TestNewCarriesDefaultTimeout(t *testing.T) {
+	c := New("http://127.0.0.1:1/v1", "", "m")
+	if c.HTTP.Timeout != 120*time.Second {
+		t.Fatalf("default client timeout = %v, want 120s (mac parity)", c.HTTP.Timeout)
+	}
+}
+
 func TestReadEnvValueFromServiceEnv(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "service.env")

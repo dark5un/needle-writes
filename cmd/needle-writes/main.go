@@ -284,8 +284,12 @@ func run(args []string, hold time.Duration) int {
 		model = cfg.Model // local engines answer any name with the loaded model
 	}
 	client := strata.New(endpoint, key, model)
+	client.MaxTokens = cfg.MaxTokens
+	client.HTTP.Timeout = cfg.Timeout
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second) // one explicit budget for the whole one-shot
+	// One explicit budget for the whole one-shot: the per-request
+	// engine deadline plus headroom for capture and delivery.
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+30*time.Second)
 	defer cancel()
 
 	deps := command.Deps{

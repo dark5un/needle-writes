@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeCfg(t *testing.T, body string) {
@@ -148,5 +149,68 @@ func TestKeyFileWithoutKeyVarKeepsDefault(t *testing.T) {
 	}
 	if cfg.KeyVar != "API_KEY" {
 		t.Fatalf("KeyVar default lost when only key_file is set: %q", cfg.KeyVar)
+	}
+}
+
+func TestMaxTokensAndTimeoutOverrides(t *testing.T) {
+	// mac parity: engine budget keys (needle-mac: max_tokens, timeout).
+	writeCfg(t, "max_tokens = 8192\ntimeout = 45\n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxTokens != 8192 {
+		t.Fatalf("MaxTokens = %d, want 8192", cfg.MaxTokens)
+	}
+	if cfg.Timeout != 45*time.Second {
+		t.Fatalf("Timeout = %v, want 45s", cfg.Timeout)
+	}
+}
+
+func TestEngineBudgetDefaults(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxTokens != 4096 {
+		t.Fatalf("default MaxTokens = %d, want 4096 (mac parity)", cfg.MaxTokens)
+	}
+	if cfg.Timeout != 120*time.Second {
+		t.Fatalf("default Timeout = %v, want 120s (mac parity)", cfg.Timeout)
+	}
+}
+
+func TestMaxTokensClamped(t *testing.T) {
+	// Bounds follow the mac config parser: values outside 1..32768
+	// clamp rather than fail (tuning knobs, not credential paths).
+	writeCfg(t, "max_tokens = 99999\n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxTokens != 32768 {
+		t.Fatalf("MaxTokens = %d, want clamp to 32768", cfg.MaxTokens)
+	}
+	writeCfg(t, "max_tokens = 0\n")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxTokens != 1 {
+		t.Fatalf("MaxTokens = %d, want clamp to 1", cfg.MaxTokens)
+	}
+}
+
+func TestEngineBudgetGarbageFails(t *testing.T) {
+	// A non-numeric budget value is a typo worth failing loud on;
+	// a zero timeout would kill every request before the engine runs.
+	writeCfg(t, "max_tokens = banana\n")
+	if _, err := Load(); err == nil {
+		t.Fatal("non-numeric max_tokens must error")
+	}
+	writeCfg(t, "timeout = 0\n")
+	if _, err := Load(); err == nil {
+		t.Fatal("zero timeout must error")
 	}
 }

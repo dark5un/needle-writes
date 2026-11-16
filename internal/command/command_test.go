@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dark5un/needle-writes/internal/action"
+	"github.com/dark5un/needle-writes/internal/strata"
 )
 
 // fake deps: capture seams instead of a live compositor/engine.
@@ -213,16 +215,60 @@ func TestNoPasteSuccessNotifiesWithActionAndElapsed(t *testing.T) {
 	}
 }
 
-func TestPasteModeFailureDoesNotNotify(t *testing.T) {
-	// Paste mode's failure is observable (the selection is visibly
-	// untouched): no notification noise.
-	d := &deps{primary: "x", clipboard: "user clip", chatErr: errors.New("engine down")}
+func TestPasteModeNonEngineFailureDoesNotNotify(t *testing.T) {
+	// Paste-mode aborts without a known reason stay silent: the
+	// selection is visibly untouched. (Engine failures are NOT
+	// silent any more — see TestPasteModeEngineFailureNotifies.)
+	d := &deps{primary: "x", clipboard: "user clip", chooseErr: errors.New("fuzzel died")}
+	code, _, _ := run(t, d, "pick")
+	if code != ExitWayland {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.notifyMsgs) != 0 {
+		t.Fatalf("notifyMsgs = %v, want none for a paste-mode palette failure", d.notifyMsgs)
+	}
+}
+
+func TestPasteModeEngineFailureNotifiesWithReason(t *testing.T) {
+	// "errors like the ai server being unreachable should be known":
+	// a classified engine failure gets a desktop notice naming the
+	// reason, in EVERY mode — paste mode's "visibly untouched" signal
+	// is too weak when the user is looking at the clock, not the text.
+	d := &deps{primary: "x", clipboard: "user clip",
+		chatErr: &strata.BackendError{Reason: "LLM backend not available", Host: "ai.example:11434", Err: errors.New("dial: connection refused")}}
+	code, _, errb := run(t, d, "proofread")
+	if code != ExitEngine {
+		t.Fatalf("exit=%d", code)
+	}
+	if len(d.notifyMsgs) != 1 {
+		t.Fatalf("notifyMsgs = %v, want exactly one reason notice", d.notifyMsgs)
+	}
+	msg := d.notifyMsgs[0]
+	if !strings.Contains(msg, "proofread failed") || !strings.Contains(msg, "LLM backend not available") || !strings.Contains(msg, "ai.example:11434") {
+		t.Fatalf("notice %q must name the action, the reason and the host", msg)
+	}
+	// stderr keeps the full transport detail for anyone watching.
+	if !strings.Contains(errb, "connection refused") {
+		t.Fatalf("stderr = %q, want the underlying detail", errb)
+	}
+}
+
+func TestNoPasteEngineFailureNoticeCarriesReason(t *testing.T) {
+	// The reason rides along in no-paste mode too, next to the
+	// clipboard-unchanged reassurance.
+	d := &deps{primary: "x", clipboard: "user clip",
+		chatErr: fmt.Errorf("strata: %w", &strata.BackendError{Reason: "LLM backend timed out", Host: "ai.example:11434", Err: errors.New("context deadline exceeded")})}
+	d.noPaste = true
 	code, _, _ := run(t, d, "proofread")
 	if code != ExitEngine {
 		t.Fatalf("exit=%d", code)
 	}
-	if len(d.notifyMsgs) != 0 {
-		t.Fatalf("notifyMsgs = %v, want none in paste mode", d.notifyMsgs)
+	if len(d.notifyMsgs) != 1 {
+		t.Fatalf("notifyMsgs = %v, want one notice", d.notifyMsgs)
+	}
+	msg := d.notifyMsgs[0]
+	if !strings.Contains(msg, "LLM backend timed out") || !strings.Contains(msg, "clipboard unchanged") {
+		t.Fatalf("notice %q must carry reason AND the unchanged-clipboard guarantee", msg)
 	}
 }
 

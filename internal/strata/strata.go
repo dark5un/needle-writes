@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -32,13 +34,29 @@ type Client struct {
 	MaxTokens int // generated-token budget; 0 = omit from the request
 }
 
+// dialTimeout bounds ONLY the connect phase: an endpoint that is down,
+// unroutable or behind a dead VPN must fail fast and be reported as
+// unavailable, while an established connection gets the full
+// (configurable) request timeout for the model to think.
+const dialTimeout = 10 * time.Second
+
 // New returns a client with a sane default timeout.
 func New(baseURL, apiKey, model string) *Client {
 	return &Client{
 		BaseURL: baseURL,
 		APIKey:  apiKey,
 		Model:   model,
-		HTTP:    &http.Client{Timeout: 120 * time.Second},
+		HTTP: &http.Client{
+			Timeout: 120 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   dialTimeout,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2: true,
+			},
+		},
 	}
 }
 
@@ -46,6 +64,79 @@ var (
 	ErrEmptyChoices = errors.New("strata: empty choices")
 	ErrKeyNotFound  = errors.New("strata: key not found in env file")
 )
+
+// BackendError classifies an endpoint failure with a short,
+// user-presentable Reason and the offending Host, wrapping the
+// underlying transport error so nothing is lost from stderr. The
+// distinction matters at the UX level: "LLM backend not available"
+// (down server, dead VPN, wrong port) is actionable, "timed out" is a
+// slow-model signal, and neither should be mistaken for the other.
+type BackendError struct {
+	Err    error  // underlying failure (kept for stderr detail)
+	Reason string // one-line, safe to show in a desktop notice
+	Host   string // endpoint host:port from BaseURL
+}
+
+func (e *BackendError) Error() string {
+	if e.Host == "" {
+		return fmt.Sprintf("%s: %v", e.Reason, e.Err)
+	}
+	return fmt.Sprintf("%s (%s): %v", e.Reason, e.Host, e.Err)
+}
+
+// Unwrap keeps the transport error reachable via errors.Is/As.
+func (e *BackendError) Unwrap() error { return e.Err }
+
+// Notice extracts the user-presentable reason from an engine error,
+// or "" when the failure is not classifiable (callers then fall back
+// to their generic wording). The chain may carry the BackendError
+// under extra %w wrapping (the engine's "primary: ...; fallback: ..."
+// composition), which errors.As sees through.
+func Notice(err error) string {
+	var be *BackendError
+	if errors.As(err, &be) {
+		if be.Host == "" {
+			return be.Reason
+		}
+		return be.Reason + " (" + be.Host + ")"
+	}
+	if errors.Is(err, ErrEmptyResult) {
+		return "model returned an empty result"
+	}
+	return ""
+}
+
+// hostOf parses the authority out of a BaseURL for notice wording.
+func hostOf(baseURL string) string {
+	if u, err := url.Parse(baseURL); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return baseURL
+}
+
+// classifyTransport maps a failed HTTP round trip to a BackendError:
+// dial-phase failures (refused, no route, unresolved name, connect
+// timeout) mean the endpoint is not reachable; a timeout after the
+// connection exists means the backend is reachable but too slow.
+func classifyTransport(baseURL string, err error) error {
+	host := hostOf(baseURL)
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "connect") {
+		return &BackendError{Reason: "LLM backend not available", Host: host, Err: err}
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return &BackendError{Reason: "LLM backend not available (name does not resolve)", Host: host, Err: err}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &BackendError{Reason: "LLM backend timed out", Host: host, Err: err}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &BackendError{Reason: "LLM backend timed out", Host: host, Err: err}
+	}
+	return err
+}
 
 // maxResponseBytes caps how much of a response body we buffer.
 const maxResponseBytes = 4 << 20
@@ -99,7 +190,7 @@ func (c *Client) chatAttempt(ctx context.Context, msgs []Message, temperature fl
 	// #nosec G704 -- same operator-configured endpoint as above.
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("strata: %w", err)
+		return "", "", fmt.Errorf("strata: %w", classifyTransport(c.BaseURL, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -111,7 +202,13 @@ func (c *Client) chatAttempt(ctx context.Context, msgs []Message, temperature fl
 		return "", "", fmt.Errorf("strata: response larger than %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("strata: HTTP %d: %s", resp.StatusCode, snippet(data))
+		// An error status is a known backend failure mode too: the
+		// notice says so (with the code), the snippet stays on stderr.
+		return "", "", &BackendError{
+			Reason: fmt.Sprintf("LLM backend error: HTTP %d", resp.StatusCode),
+			Host:   hostOf(c.BaseURL),
+			Err:    errors.New(snippet(data)),
+		}
 	}
 
 	var cr chatResponse

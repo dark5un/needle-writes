@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dark5un/needle-writes/internal/action"
+	"github.com/dark5un/needle-writes/internal/strata"
 )
 
 // Process exit codes (documented in README; stable contract for binds).
@@ -51,11 +52,14 @@ type Deps struct {
 	// compositor's current one (not superseded by a newer run).
 	// nil = assume still owned.
 	Owns func() bool
-	// Notify is the desktop-notice seam for NoPaste mode, where runs
-	// have no visible end-state: it announces completion (action +
-	// elapsed, so silence means still working) and post-capture
-	// failures (so a stale clipboard is never mistaken for a
-	// result). nil = no notices.
+	// Notify is the desktop-notice seam: it announces completion in
+	// NoPaste mode (action + elapsed, so silence means still
+	// working), post-capture failures in NoPaste mode (so a stale
+	// clipboard is never mistaken for a result), and — in EVERY
+	// mode — classified engine failures with the user-presentable
+	// reason ("LLM backend not available (host)" etc.), because a
+	// dead backend is invisible in paste mode too when the only
+	// signal is a clock that never stops. nil = no notices.
 	Notify func(body string)
 	// CopyCombo/PasteCombo override the capture-fallback and delivery
 	// combos. Terminals need e.g. ctrl+shift+v (plain Ctrl+V is not
@@ -185,22 +189,37 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		}
 	}
 
-	// notifyFail surfaces post-capture failures in --no-paste mode:
-	// there, a failed run is otherwise pixel-identical to a
-	// successful one (palette closed, clipboard looks delivered) and
-	// the user could paste stale content believing it is the result
-	// (UX review). Paste-mode failures are observable — the
-	// selection is visibly untouched — so no noise there.
-	notifyFail := func() {
-		if d.NoPaste && d.Notify != nil {
-			// Symmetry with the completion notice: name the action
-			// once the palette has resolved one.
-			what := act.Name
-			if what == "" {
-				what = "rewrite"
-			}
-			d.Notify(what + " failed — clipboard unchanged")
+	// notifyFail surfaces post-capture failures: in --no-paste mode
+	// a failed run is otherwise pixel-identical to a successful one
+	// (palette closed, clipboard looks delivered) and the user could
+	// paste stale content believing it is the result (UX review).
+	// Paste-mode failures without a known reason stay quiet — the
+	// selection is visibly untouched — but a CLASSIFIED engine
+	// failure always notifies, in every mode: "could not reach the
+	// engine" must be known, not guessed from a stalled clock
+	// (operator request 2026-11-16). reason="" keeps the old
+	// generic wording.
+	notifyFail := func(reason string) {
+		if d.Notify == nil {
+			return
 		}
+		if reason == "" && !d.NoPaste {
+			return
+		}
+		// Symmetry with the completion notice: name the action
+		// once the palette has resolved one.
+		what := act.Name
+		if what == "" {
+			what = "rewrite"
+		}
+		body := what + " failed"
+		if reason != "" {
+			body += ": " + reason
+		}
+		if d.NoPaste {
+			body += " — clipboard unchanged"
+		}
+		d.Notify(body)
 	}
 
 	sel, capErr := d.ReadPrimary()
@@ -222,7 +241,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if capErr != nil {
 			_, _ = fmt.Fprintf(stderr, "read clipboard: %v\n", capErr)
 			restoreClip(sel) // round-4 finding 1: post-Ctrl+C abort
-			notifyFail()
+			notifyFail("")
 			return ExitWayland
 		}
 	}
@@ -239,7 +258,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if cerr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: palette: %v\n", cerr)
 			restoreClip(sel)
-			notifyFail()
+			notifyFail("")
 			return ExitWayland
 		}
 		if line == "" {
@@ -250,7 +269,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		if perr != nil {
 			_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", perr)
 			restoreClip(sel)
-			notifyFail()
+			notifyFail("")
 			return ExitUsage
 		}
 		act = picked
@@ -260,13 +279,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	if errors.Is(err, action.ErrTooLarge) {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
 		restoreClip(sel)
-		notifyFail()
+		notifyFail("")
 		return ExitTooLarge
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: %v\n", err)
 		restoreClip(sel)
-		notifyFail()
+		notifyFail("")
 		return ExitUsage
 	}
 
@@ -276,7 +295,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: engine call failed: %v\n", err)
 		restoreClip(sel)
-		notifyFail()
+		// Known backend failures (unreachable, timed out, error
+		// status) must be VISIBLE, not inferred from a stalled
+		// run: Notice gives the one-line reason, "" for anything
+		// unclassified keeps the old behaviour.
+		notifyFail(strata.Notice(err))
 		return ExitEngine
 	}
 	res = action.Clean(res)
@@ -284,13 +307,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, d Deps) i
 		// Never paste nothing: an empty model result aborts the action.
 		_, _ = fmt.Fprintln(stderr, "needle-writes: engine returned an empty result, aborting")
 		restoreClip(sel)
-		notifyFail()
+		notifyFail(strata.Notice(strata.ErrEmptyResult))
 		return ExitEngine
 	}
 	if clErr := d.Claim(res); clErr != nil {
 		_, _ = fmt.Fprintf(stderr, "needle-writes: clipboard claim failed: %v\n", clErr)
 		restoreClip(sel)
-		notifyFail()
+		notifyFail("")
 		return ExitWayland
 	}
 	// The result claim itself clobbers CLIPBOARD: from here the same

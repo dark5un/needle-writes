@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -181,5 +182,100 @@ func TestReadEnvValueMissingKey(t *testing.T) {
 	_, err := ReadEnvValue(path, "API_KEY")
 	if !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("err = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// --- backend failure classification (the "errors should be known" contract:
+// an unreachable engine must be distinguishable from a slow one, and the
+// user-facing reason must be extractable from the error chain) ---
+
+func TestConnectionRefusedIsBackendUnavailable(t *testing.T) {
+	// Closed server: dial gets connection refused immediately.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	c := New(url+"/v1", "test-key-not-secret", "m")
+	_, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0)
+	var be *BackendError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v, want a *BackendError", err)
+	}
+	if be.Reason != "LLM backend not available" {
+		t.Fatalf("reason = %q", be.Reason)
+	}
+	if be.Host == "" || !strings.Contains(err.Error(), be.Host) {
+		t.Fatalf("err = %v, must name the endpoint host", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("err = %v, must keep the underlying transport detail", err)
+	}
+}
+
+func TestUnresolvableHostIsBackendUnavailable(t *testing.T) {
+	c := New("http://needle.invalid:11434/v1", "test-key-not-secret", "m")
+	_, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0)
+	var be *BackendError
+	if !errors.As(err, &be) || be.Reason != "LLM backend not available" {
+		t.Fatalf("err = %v, want BackendUnavailable classification", err)
+	}
+}
+
+func TestRequestTimeoutIsClassifiedSeparately(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, `{}`)
+	})
+	c.HTTP.Timeout = 50 * time.Millisecond
+	_, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0)
+	var be *BackendError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v, want a *BackendError", err)
+	}
+	if be.Reason != "LLM backend timed out" {
+		t.Fatalf("reason = %q, want the slow-backend class", be.Reason)
+	}
+}
+
+func TestHTTPErrorStatusIsClassified(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "model is loading", http.StatusServiceUnavailable)
+	})
+	_, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "x"}}, 0)
+	var be *BackendError
+	if !errors.As(err, &be) {
+		t.Fatalf("err = %v, want a *BackendError", err)
+	}
+	if be.Reason != "LLM backend error: HTTP 503" {
+		t.Fatalf("reason = %q", be.Reason)
+	}
+	if !strings.Contains(err.Error(), "model is loading") {
+		t.Fatalf("err = %v, must keep the response snippet", err)
+	}
+}
+
+func TestNewClientDialsFast(t *testing.T) {
+	// A blackholed connect (VPN down, SYN dropped) must fail within the
+	// dial budget, not the full per-request timeout.
+	c := New("http://10.255.255.1:11434/v1", "test-key-not-secret", "m")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := c.Chat(ctx, []Message{{Role: "user", Content: "x"}}, 0)
+	var be *BackendError
+	if !errors.As(err, &be) || be.Reason != "LLM backend not available" {
+		t.Fatalf("err = %v, want unavailable within the dial budget", err)
+	}
+}
+
+func TestNoticeExtractsUserFacingReason(t *testing.T) {
+	be := &BackendError{Reason: "LLM backend not available", Host: "ai.example:11434", Err: errors.New("dial: no route")}
+	if got := Notice(fmt.Errorf("strata: %w", be)); got != "LLM backend not available (ai.example:11434)" {
+		t.Fatalf("Notice = %q", got)
+	}
+	if got := Notice(ErrEmptyResult); got != "model returned an empty result" {
+		t.Fatalf("Notice(empty) = %q", got)
+	}
+	if got := Notice(errors.New("boom")); got != "" {
+		t.Fatalf("Notice(unknown) = %q, want empty", got)
 	}
 }

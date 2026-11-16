@@ -7,8 +7,111 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dark5un/needle-writes/internal/config"
 	"github.com/dark5un/needle-writes/internal/palette"
 )
+
+func TestBuildEnginePrimary(t *testing.T) {
+	clearNeedleEnv(t)
+	cfg := config.Defaults()
+	e := buildEngine(cfg)
+	if e.Fallback != nil {
+		t.Fatal("local-only default: no fallback endpoint unless configured")
+	}
+	if e.Primary.BaseURL != cfg.Endpoint || e.Primary.Model != cfg.Model {
+		t.Fatalf("primary wiring wrong: %+v", e.Primary)
+	}
+	if e.Primary.MaxTokens != cfg.MaxTokens || e.Primary.HTTP.Timeout != cfg.Timeout {
+		t.Fatalf("engine budget not applied: max_tokens=%d timeout=%v", e.Primary.MaxTokens, e.Primary.HTTP.Timeout)
+	}
+	// Env beats config (the repo's documented precedence).
+	t.Setenv(urlEnvVar, "http://envhost:9/v1")
+	t.Setenv(modelEnvVar, "env-model")
+	e = buildEngine(cfg)
+	if e.Primary.BaseURL != "http://envhost:9/v1" || e.Primary.Model != "env-model" {
+		t.Fatalf("env overrides lost: %+v", e.Primary)
+	}
+}
+
+func TestBuildEngineFallbackWiring(t *testing.T) {
+	clearNeedleEnv(t)
+	cfg := config.Defaults()
+	cfg.Model = "m1"
+	cfg.FallbackEndpoint = "http://ai.tailnet.ts.net:8080/v1"
+	e := buildEngine(cfg)
+	if e.Fallback == nil {
+		t.Fatal("fallback_endpoint set: engine must carry a fallback client")
+	}
+	if e.Fallback.BaseURL != cfg.FallbackEndpoint {
+		t.Fatalf("fallback URL = %q", e.Fallback.BaseURL)
+	}
+	// No fallback_model anywhere: inherit the primary model name.
+	if e.Fallback.Model != "m1" {
+		t.Fatalf("fallback model should default to the primary's: %q", e.Fallback.Model)
+	}
+	if e.Fallback.MaxTokens != cfg.MaxTokens || e.Fallback.HTTP.Timeout != cfg.Timeout {
+		t.Fatal("engine budget must apply to the fallback too")
+	}
+	// Config fallback_model, then env NEEDLE_FALLBACK_MODEL wins over it.
+	cfg.FallbackModel = "fb-config"
+	e = buildEngine(cfg)
+	if e.Fallback.Model != "fb-config" {
+		t.Fatalf("fallback_model config lost: %q", e.Fallback.Model)
+	}
+	t.Setenv(fbModelEnvVar, "fb-env")
+	e = buildEngine(cfg)
+	if e.Fallback.Model != "fb-env" {
+		t.Fatalf("fallback env precedence wrong: %q", e.Fallback.Model)
+	}
+	// Env fallback URL beats config.
+	t.Setenv(fbURLEnvVar, "http://envfb/v1")
+	e = buildEngine(cfg)
+	if e.Fallback.BaseURL != "http://envfb/v1" {
+		t.Fatalf("fallback URL env override lost: %q", e.Fallback.BaseURL)
+	}
+}
+
+func TestBuildEngineFallbackKeyResolution(t *testing.T) {
+	clearNeedleEnv(t)
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "fallback.env")
+	if err := os.WriteFile(envFile, []byte("# key for the secondary endpoint\nFB_KEY=sekret-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.FallbackEndpoint = "http://x/v1"
+	cfg.FallbackKeyFile = envFile
+	cfg.FallbackKeyVar = "FB_KEY"
+	e := buildEngine(cfg)
+	if e.Fallback.APIKey != "sekret-value" {
+		t.Fatalf("fallback key not read from key_file/key_var")
+	}
+	// NEEDLE_FALLBACK_API_KEY env wins over the file.
+	t.Setenv(fbKeyEnvVar, "from-env")
+	e = buildEngine(cfg)
+	if e.Fallback.APIKey != "from-env" {
+		t.Fatalf("fallback key env precedence wrong")
+	}
+	// Missing file variable is fine (some engines need no key).
+	t.Setenv(fbKeyEnvVar, "")
+	cfg.FallbackKeyVar = "ABSENT"
+	e = buildEngine(cfg)
+	if e.Fallback.APIKey != "" {
+		t.Fatal("absent key var must yield no key, not an error path")
+	}
+}
+
+// clearNeedleEnv blanks every needle env override so config-only tests
+// are not polluted by the developer's shell.
+func clearNeedleEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		urlEnvVar, modelEnvVar, keyEnvVar,
+		fbURLEnvVar, fbModelEnvVar, fbKeyEnvVar,
+	} {
+		t.Setenv(name, "")
+	}
+}
 
 func TestThemePalette(t *testing.T) {
 	// Design review: one coherent color system per widget. With a

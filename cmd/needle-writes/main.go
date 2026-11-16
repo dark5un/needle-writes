@@ -28,6 +28,11 @@ const (
 	keyEnvVar   = "NEEDLE_API_KEY"
 	urlEnvVar   = "NEEDLE_STRATA_URL"
 	modelEnvVar = "NEEDLE_MODEL"
+	// Secondary (fallback) endpoint overrides — mac parity: used only
+	// when the primary fails, never unless explicitly configured.
+	fbURLEnvVar   = "NEEDLE_FALLBACK_URL"
+	fbModelEnvVar = "NEEDLE_FALLBACK_MODEL"
+	fbKeyEnvVar   = "NEEDLE_FALLBACK_API_KEY"
 	// paletteWidthChars fits the longest padded item line without
 	// mid-word truncation; pinned to the registry's own budget.
 	paletteWidthChars = action.PaletteLineWidth
@@ -222,6 +227,64 @@ func palettePrompt(base string, noPaste bool) string {
 	return base + " (replace selection)"
 }
 
+// envOr returns the environment value when non-empty, else the
+// config/default value (precedence: env > config file > built-in).
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// resolveKey returns the bearer key for one endpoint: env wins, else
+// key_file/key_var (a missing file or variable is fine — some engines
+// need no key; the engine call surfaces real auth problems). Never
+// print the value.
+func resolveKey(envName, file, varName string) string {
+	if v := os.Getenv(envName); v != "" {
+		return v
+	}
+	if file != "" {
+		if v, kerr := strata.ReadEnvValue(file, varName); kerr == nil {
+			return v
+		}
+	}
+	return ""
+}
+
+// buildEngine assembles the primary (local) client and, only when the
+// operator configured one, the fallback client — endpoints, models and
+// keys each resolved env > config, engine budget applied to both.
+func buildEngine(cfg config.Config) *strata.Engine {
+	primary := strata.New(
+		envOr(urlEnvVar, cfg.Endpoint),
+		resolveKey(keyEnvVar, cfg.KeyFile, cfg.KeyVar),
+		envOr(modelEnvVar, cfg.Model),
+	)
+	applyBudget(primary, cfg)
+	engine := &strata.Engine{Primary: primary}
+	if cfg.FallbackEndpoint == "" && os.Getenv(fbURLEnvVar) == "" {
+		return engine // local-only shipped default
+	}
+	fb := strata.New(
+		envOr(fbURLEnvVar, cfg.FallbackEndpoint),
+		resolveKey(fbKeyEnvVar, cfg.FallbackKeyFile, cfg.FallbackKeyVar),
+		envOr(fbModelEnvVar, cfg.FallbackModel),
+	)
+	if fb.Model == "" {
+		fb.Model = primary.Model // inherit unless pinned
+	}
+	applyBudget(fb, cfg)
+	engine.Fallback = fb
+	return engine
+}
+
+// applyBudget pins the per-request engine knobs on a client.
+func applyBudget(c *strata.Client, cfg config.Config) {
+	c.MaxTokens = cfg.MaxTokens
+	c.HTTP.Timeout = cfg.Timeout
+}
+
 func run(args []string, hold time.Duration) int {
 	args, pasteCombo, copyCombo, noPaste, cerr := extractCombos(args)
 	if cerr != nil {
@@ -267,25 +330,7 @@ func run(args []string, hold time.Duration) int {
 	}
 	defer wl.Close()
 
-	endpoint := os.Getenv(urlEnvVar)
-	if endpoint == "" {
-		endpoint = cfg.Endpoint
-	}
-	key := os.Getenv(keyEnvVar)
-	if key == "" && cfg.KeyFile != "" {
-		// Missing file/variable is fine: some local engines need no
-		// key; the engine call will surface any real auth problem.
-		if v, kerr := strata.ReadEnvValue(cfg.KeyFile, cfg.KeyVar); kerr == nil {
-			key = v
-		}
-	}
-	model := os.Getenv(modelEnvVar)
-	if model == "" {
-		model = cfg.Model // local engines answer any name with the loaded model
-	}
-	client := strata.New(endpoint, key, model)
-	client.MaxTokens = cfg.MaxTokens
-	client.HTTP.Timeout = cfg.Timeout
+	engine := buildEngine(cfg)
 
 	// One explicit budget for the whole one-shot: the per-request
 	// engine deadline plus headroom for capture and delivery.
@@ -324,7 +369,13 @@ func run(args []string, hold time.Duration) int {
 			for i, m := range msgs {
 				sm[i] = strata.Message{Role: m.Role, Content: m.Content}
 			}
-			return client.Chat(ctx, sm, temperature)
+			text, source, eerr := engine.Chat(ctx, sm, temperature)
+			if eerr == nil && source == strata.SourceFallback {
+				// Privacy-critical deviation from the all-local
+				// default: announce every use, mac-style.
+				_, _ = fmt.Fprintf(os.Stderr, "needle-writes: WARNING: selection sent to fallback endpoint %s — text leaves this machine\n", engine.Fallback.BaseURL)
+			}
+			return text, eerr
 		},
 	}
 	code := command.Run(ctx, args, os.Stdout, os.Stderr, deps)

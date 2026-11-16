@@ -16,16 +16,26 @@ import (
 
 // Config is the resolved settings surface.
 type Config struct {
-	Endpoint      string        // OpenAI-compatible base URL
-	Model         string        // model name sent to the endpoint
-	KeyFile       string        // env-format file holding the API key ("" = none)
-	KeyVar        string        // variable name inside KeyFile
-	ThemeFile     string        // matugen-style colors.json for palette colors ("" = fuzzel defaults)
-	PalettePrompt string        // palette prompt text
-	PasteCombo    string        // e.g. "ctrl+shift+v" ("" = default Ctrl+V)
-	CopyCombo     string        // e.g. "ctrl+shift+c" ("" = default Ctrl+C)
-	MaxTokens     int           // generated-token budget per request
-	Timeout       time.Duration // per-request engine deadline
+	Endpoint      string // OpenAI-compatible base URL
+	Model         string // model name sent to the endpoint
+	KeyFile       string // env-format file holding the API key ("" = none)
+	KeyVar        string // variable name inside KeyFile
+	ThemeFile     string // matugen-style colors.json for palette colors ("" = fuzzel defaults)
+	PalettePrompt string // palette prompt text
+	PasteCombo    string // e.g. "ctrl+shift+v" ("" = default Ctrl+V)
+	CopyCombo     string // e.g. "ctrl+shift+c" ("" = default Ctrl+C)
+
+	// Optional secondary endpoint, used ONLY when the primary fails
+	// (mac parity). Empty FallbackEndpoint keeps the local-only
+	// shipped default: nothing ever leaves the machine.
+	FallbackEndpoint string // any OpenAI-compatible URL (e.g. a tailscale peer)
+	FallbackModel    string // model name for the fallback ("" = inherit the primary's)
+	FallbackKeyFile  string // env-format file holding the fallback key ("" = none)
+	FallbackKeyVar   string // variable name inside FallbackKeyFile
+
+	// Value fields last (fieldalignment): engine budget per request.
+	MaxTokens int           // generated-token budget per request
+	Timeout   time.Duration // per-request engine deadline
 }
 
 // Defaults for a stock install: llama.cpp-style local endpoint, no key
@@ -68,6 +78,22 @@ var known = map[string]func(*Config, string) error{
 	"copy_combo":     func(c *Config, v string) error { c.CopyCombo = v; return nil },
 	"max_tokens":     setMaxTokens,
 	"timeout":        setTimeout,
+	"fallback_endpoint": func(c *Config, v string) error {
+		c.FallbackEndpoint = v
+		return nil
+	},
+	"fallback_model": func(c *Config, v string) error {
+		c.FallbackModel = v
+		return nil
+	},
+	"fallback_key_file": func(c *Config, v string) error {
+		c.FallbackKeyFile = ExpandHome(v)
+		return nil
+	},
+	"fallback_key_var": func(c *Config, v string) error {
+		c.FallbackKeyVar = v
+		return nil
+	},
 }
 
 // setMaxTokens parses the generated-token budget; out-of-range values
@@ -138,6 +164,9 @@ func Load() (Config, error) {
 	}
 	if cfg.KeyVar == "" {
 		cfg.KeyVar = "API_KEY"
+	}
+	if cfg.FallbackKeyVar == "" {
+		cfg.FallbackKeyVar = "API_KEY"
 	}
 	if cfg.PalettePrompt == "" {
 		cfg.PalettePrompt = Defaults().PalettePrompt

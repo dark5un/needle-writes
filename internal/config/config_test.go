@@ -214,3 +214,52 @@ func TestEngineBudgetGarbageFails(t *testing.T) {
 		t.Fatal("zero timeout must error")
 	}
 }
+
+func TestFallbackDisabledByDefault(t *testing.T) {
+	// Local-only is the shipped default: no fallback endpoint unless
+	// the operator opts in via config (or env).
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackEndpoint != "" {
+		t.Fatalf("fallback must be off by default: %+v", cfg)
+	}
+}
+
+func TestFallbackKeysParse(t *testing.T) {
+	writeCfg(t, `fallback_endpoint = http://100.x.y.z:8080/v1  # over tailscale
+fallback_model = some-model
+fallback_key_file = ~/.config/needle-writes/fallback.env
+fallback_key_var = FB_KEY
+`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackEndpoint != "http://100.x.y.z:8080/v1" {
+		t.Fatalf("fallback_endpoint = %q", cfg.FallbackEndpoint)
+	}
+	if cfg.FallbackModel != "some-model" {
+		t.Fatalf("fallback_model = %q", cfg.FallbackModel)
+	}
+	home, _ := os.UserHomeDir()
+	if cfg.FallbackKeyFile != filepath.Join(home, ".config/needle-writes/fallback.env") {
+		t.Fatalf("fallback_key_file tilde not expanded: %q", cfg.FallbackKeyFile)
+	}
+	if cfg.FallbackKeyVar != "FB_KEY" {
+		t.Fatalf("fallback_key_var = %q", cfg.FallbackKeyVar)
+	}
+}
+
+func TestFallbackKeyVarDefault(t *testing.T) {
+	writeCfg(t, "fallback_endpoint = http://x/v1\nfallback_key_file = ~/fb.env\n")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackKeyVar != "API_KEY" {
+		t.Fatalf("FallbackKeyVar default lost: %q", cfg.FallbackKeyVar)
+	}
+}

@@ -100,7 +100,7 @@ func usage(w io.Writer) {
 	_, _ = fmt.Fprint(w, "actions:\n")
 	for _, name := range action.List() {
 		a, _ := action.Get(name)
-		_, _ = fmt.Fprintf(w, "  %-14s %s\n", name, a.Description)
+		_, _ = fmt.Fprintf(w, "  %-18s %s\n", name, a.Description)
 	}
 }
 

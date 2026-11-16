@@ -10,7 +10,7 @@ func TestListReturnsBuiltinActions(t *testing.T) {
 	want := []string{
 		"proofread", "shorten", "professional", "casual",
 		"summarize", "translate-en", "translate-el",
-		"agentify", "agentify+",
+		"agentify", "agentify+", "publisher-opinion", "book-reviewer",
 	}
 	got := List()
 	if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -48,6 +48,45 @@ func TestAgentifyActionsRegistered(t *testing.T) {
 	}
 	if !strings.Contains(lowPlain, "english") {
 		t.Fatalf("agentify prompt must pin the output language: %q", plain.SystemPrompt)
+	}
+}
+
+func TestReviewActionsRegistered(t *testing.T) {
+	// mac parity (needle-mac): two critique actions that echo the
+	// original text verbatim, then append the assessment. Pin the
+	// two-part structure and the language-matching clause.
+	for _, name := range []string{"publisher-opinion", "book-reviewer"} {
+		a, err := Get(name)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", name, err)
+		}
+		if a.Description == "" {
+			t.Fatalf("%s missing description", name)
+		}
+		if a.Temperature < 0 || a.Temperature > 2 {
+			t.Fatalf("%s temperature out of range: %f", name, a.Temperature)
+		}
+		low := strings.ToLower(a.SystemPrompt)
+		if !strings.Contains(low, "verbatim") {
+			t.Fatalf("%s prompt must pin a verbatim echo of the original: %q", name, a.SystemPrompt)
+		}
+		if !strings.Contains(low, "two parts") {
+			t.Fatalf("%s prompt must pin the two-part reply shape: %q", name, a.SystemPrompt)
+		}
+		if !strings.Contains(low, "same language") {
+			t.Fatalf("%s prompt must match the critique language to the passage: %q", name, a.SystemPrompt)
+		}
+	}
+	// Each critic keeps its own persona and evidence discipline.
+	pub, _ := Get("publisher-opinion")
+	if !strings.Contains(strings.ToLower(pub.SystemPrompt), "acquire") ||
+		!strings.Contains(strings.ToLower(pub.SystemPrompt), "market") {
+		t.Fatalf("publisher-opinion prompt must carry the publisher persona (market fit, acquire/revise/pass verdict): %q", pub.SystemPrompt)
+	}
+	rev, _ := Get("book-reviewer")
+	if !strings.Contains(strings.ToLower(rev.SystemPrompt), "specific quotes") ||
+		!strings.Contains(strings.ToLower(rev.SystemPrompt), "poetry") {
+		t.Fatalf("book-reviewer prompt must demand quote-grounded literary critique: %q", rev.SystemPrompt)
 	}
 }
 

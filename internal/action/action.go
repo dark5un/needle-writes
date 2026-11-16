@@ -90,6 +90,24 @@ var builtins = []Action{
 		Temperature:  0.6,
 		SystemPrompt: "You convert the user's rough notes, dictation, or draft prompt into a well-structured instruction for an AI agent. First capture the intent exactly and resolve ambiguity. Then EXPAND it into a complete brief: the goal, relevant context and constraints, concrete steps or deliverables, and acceptance criteria that make the finished result verifiable. Keep the expansion faithful to what the user implied — never invent unrelated requirements. Always write the result in English, translating when the input is another language. " + onlyText,
 	},
+	{
+		Name:        "publisher-opinion",
+		Description: "Original text, then a book publisher's opinion of it",
+		Temperature: 0.5,
+		SystemPrompt: `You are an experienced book publisher's editor assessing a passage. Reply in exactly two parts:
+1. The user's original text, reproduced verbatim (not one word changed).
+2. A blank line, then a short publisher's opinion of the passage: its market fit and audience, editorial strengths, what weakens it, and a one-line verdict (acquire / revise / pass) with the reason. Honest and specific, 80-150 words, written in the same language as the passage.
+Output ONLY those two parts, no preamble or code fences.`,
+	},
+	{
+		Name:        "book-reviewer",
+		Description: "Original text, then a novel/poetry reviewer's critique",
+		Temperature: 0.6,
+		SystemPrompt: `You are a literary book reviewer who covers fiction and poetry. Reply in exactly two parts:
+1. The user's original text, reproduced verbatim (not one word changed).
+2. A blank line, then a reviewer's critique of the passage as a work of literature: voice and style, imagery and language, rhythm and sound (for poetry) or characterization, scene craft and tension (for prose/novels), what it does well, where it falls flat, and a closing one-line assessment. Judge it seriously as a reader would — specific quotes from the passage as evidence, no generic praise. 100-180 words, written in the same language as the passage.
+Output ONLY those two parts, no preamble or code fences.`,
+	},
 }
 
 // List returns the built-in action names in order.
@@ -108,11 +126,13 @@ const PaletteSeparator = " — "
 // PaletteLineWidth is the rendered width budget for palette lines:
 // every PaletteItems() line must fit it (no mid-word truncation, UX
 // review round 3). The palette adapter opens fuzzel at this width.
-const PaletteLineWidth = 70
+// Sized for the longest built-in line ("book-reviewer" padded +
+// description = 74 runes).
+const PaletteLineWidth = 74
 
 // paletteNameWidth pads every action name so the separator and the
 // descriptions form aligned columns (monospace palette font).
-const paletteNameWidth = 12 // longest built-in name ("professional", "translate-en")
+const paletteNameWidth = 17 // longest built-in name ("publisher-opinion")
 
 // PaletteItems returns one display line per built-in action, in List()
 // order: "name<pad> — description", columns aligned.

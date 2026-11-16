@@ -2,9 +2,10 @@
 
 Apple-Writing-Tools-style text actions on the Linux desktop: select text,
 press a hotkey, get it proofread / shortened / retoned / summarized /
-rewritten as a clean agent prompt — served exclusively by a **local**
-LLM (any OpenAI-compatible endpoint: Strata, llama.cpp, Ollama-style
-servers). No cloud provider, ever.
+rewritten as a clean agent prompt — served by a **local** LLM (any
+OpenAI-compatible endpoint: Strata, llama.cpp, Ollama-style servers)
+by default. An **opt-in fallback endpoint** is used only when the local
+engine fails; with it unset, nothing ever leaves your machine.
 
 Built for **Hyprland/Wayland** in **pure Go**: the tool speaks the Wayland
 wire protocols in-process (`ext_data_control` for selection read/claim,
@@ -23,9 +24,15 @@ resident, and the whole tree is readable Go behind `go vet` +
 
 ## Design decisions (hard requirements)
 
-- **Local AI only.** Default endpoint `http://127.0.0.1:11434/v1`; the
+- **Local AI by default.** Endpoint `http://127.0.0.1:11434/v1`; the
   API key is read at runtime from the environment (`NEEDLE_API_KEY`) or
-  a local service env file — never compiled in, never logged.
+  a local service env file — never compiled in, never logged. The
+  fallback endpoint is strictly opt-in: with `fallback_endpoint` unset
+  the tool is local-only, as ever. When you do set one, every use is
+  announced on stderr (`selection sent to fallback endpoint … — text
+  leaves this machine`); point it at a host you trust over a network
+  you control (a Tailscale address is the intended pattern) or an
+  `https://` URL.
 - **No shell-out.** Wayland protocols spoken directly over the compositor
   socket.
 - **One-shot, not a daemon.** Spawned by a compositor keybind; the claim
@@ -57,6 +64,9 @@ Configuration (all optional):
 | `NEEDLE_STRATA_URL` | config `endpoint`, else `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint |
 | `NEEDLE_API_KEY` | config `key_file`, else none | bearer key, read at runtime, never logged |
 | `NEEDLE_MODEL` | config `model`, else `needle-writes` | model name sent to the endpoint |
+| `NEEDLE_FALLBACK_URL` | config `fallback_endpoint`, else unset | secondary endpoint, tried only when the primary fails |
+| `NEEDLE_FALLBACK_MODEL` | config `fallback_model`, else the primary's model | model name for the fallback |
+| `NEEDLE_FALLBACK_API_KEY` | config `fallback_key_file`, else none | bearer key for the fallback |
 
 ### Config file
 
@@ -73,6 +83,15 @@ theme_file     = ~/.cache/theme/colors.json # matugen-style colors for the palet
 palette_prompt = rewrite selection:
 paste_combo    = ctrl+shift+v               # set these for terminal targets
 copy_combo     = ctrl+shift+c
+max_tokens     = 4096                       # generated-token budget per request
+timeout        = 120                        # per-request engine deadline, seconds
+
+# secondary endpoint, tried ONLY when the primary fails; leave unset for
+# local-only. Use an address on a network you control (Tailscale) or https.
+#fallback_endpoint = http://100.64.0.2:8080/v1
+#fallback_model    = some-model             # default: the primary's model
+#fallback_key_file = ~/.config/needle-writes/fallback.env
+#fallback_key_var  = API_KEY
 ```
 
 Precedence: CLI flag > environment > config file > built-in default. An
@@ -108,6 +127,8 @@ needle-writes translate-en
 needle-writes translate-el
 needle-writes agentify    # rough text or draft prompt -> clear agent instruction
 needle-writes agentify+   # ...expanded: context, steps, acceptance criteria
+needle-writes publisher-opinion  # original text, then a book publisher's verdict
+needle-writes book-reviewer      # original text, then a literary critique
 needle-writes -list       # list actions
 ```
 
@@ -191,7 +212,7 @@ needle-writes pick --paste ctrl+shift+v --copy ctrl+shift+c
 | Code | Meaning |
 |---|---|
 | 0 | Result claimed (pasted via the paste combo in default mode; left on the clipboard with `--no-paste`) |
-| 1 | Engine call failed or returned an empty result (nothing pasted) |
+| 1 | Engine call failed or returned an empty result on every configured endpoint (nothing pasted) |
 | 2 | Nothing selected — select or copy text first (nothing pasted) |
 | 3 | Selection larger than the model budget |
 | 4 | Wayland/compositor failure (selection, claim, injection, or palette) |
